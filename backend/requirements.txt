@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+python-nmap
+scapy
+python-multipart
+asyncio
