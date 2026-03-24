@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Monitor, Activity, Shield, ShieldAlert, Wifi } from 'lucide-react';
+import { Search, Monitor, Activity, Shield, ShieldAlert, Wifi, Zap } from 'lucide-react';
 
 const WS_URL = "ws://localhost:8000/ws";
 const API_URL = "http://localhost:8000";
@@ -8,6 +8,9 @@ const App = () => {
     const [devices, setDevices] = useState([]);
     const [isScanning, setIsScanning] = useState(false);
     const [selected, setSelected] = useState(null);
+    const [isCapturing, setIsCapturing] = useState(false);
+    const [captureResult, setCaptureResult] = useState(null);
+    const [captureDuration, setCaptureDuration] = useState(10);
 
     useEffect(() => {
         let ws = new WebSocket(WS_URL);
@@ -35,6 +38,24 @@ const App = () => {
     const runScan = () => {
         fetch(`${API_URL}/scan?profile=deep`);
         setIsScanning(true);
+    };
+
+    const handleCapture = async (ip) => {
+        setIsCapturing(true);
+        setCaptureResult(null);
+        try {
+            const resp = await fetch(`${API_URL}/capture`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip, duration: captureDuration })
+            });
+            const data = await resp.json();
+            setCaptureResult(data);
+        } catch (err) {
+            console.error("Capture failed", err);
+        } finally {
+            setIsCapturing(false);
+        }
     };
 
     return (
@@ -118,16 +139,77 @@ const App = () => {
                     </div>
 
                     <div style={{padding: '2rem', flex: 1, overflowY: 'auto'}}>
-                        <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem', marginBottom: '2rem'}}>
+                        <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem', marginBottom: '1.5rem'}}>
                             <div style={{background: '#f4f4f5', padding: '1rem', borderRadius: 12}}>
                                 <p style={{fontSize: '0.7rem', color: '#71717a', fontWeight: 800, marginBottom: '0.5rem'}}>OS</p>
                                 <b>{selected.os || 'Unknown'}</b>
                             </div>
                             <div style={{background: '#f4f4f5', padding: '1rem', borderRadius: 12}}>
                                 <p style={{fontSize: '0.7rem', color: '#71717a', fontWeight: 800, marginBottom: '0.5rem'}}>LATENCY</p>
-                                <b>{selected.latency_ms.toFixed(2)} ms</b>
+                                <b>{selected.latency_ms ? selected.latency_ms.toFixed(2) : "0.00"} ms</b>
                             </div>
                         </div>
+
+                        {/* Capture Engine Section */}
+                        <div style={{background: '#fafafa', border: '1px dashed #d1d5db', padding: '1.5rem', borderRadius: 16, marginBottom: '2rem'}}>
+                            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem'}}>
+                                <h4 style={{margin: 0, fontSize: '0.9rem', color: '#18181b'}}>PACKET CAPTURE ENGINE</h4>
+                                <Zap size={16} color={isCapturing ? '#eab308' : '#71717a'} />
+                            </div>
+                            
+                            <div style={{display: 'flex', gap: '0.5rem', marginBottom: '1rem'}}>
+                                <input 
+                                    type="range" min="5" max="60" value={captureDuration} 
+                                    onChange={(e) => setCaptureDuration(parseInt(e.target.value))}
+                                    style={{flex: 1, accentColor: '#3f3f46'}}
+                                />
+                                <span style={{fontSize: '0.8rem', fontWeight: 800, minWidth: '40px'}}>{captureDuration}s</span>
+                            </div>
+
+                            <button 
+                                onClick={() => handleCapture(selected.ip)} 
+                                disabled={isCapturing}
+                                style={{
+                                    width: '100%', padding: '0.8rem', borderRadius: 8, border: 'none',
+                                    background: isCapturing ? '#f4f4f5' : '#18181b', color: '#fff',
+                                    fontWeight: 700, cursor: 'pointer', transition: 'all 0.2s'
+                                }}
+                            >
+                                {isCapturing ? 'CAPTURING TRAFFIC...' : 'START TSHARK CAPTURE'}
+                            </button>
+
+                            {captureResult && !isCapturing && (
+                                <div style={{marginTop: '1rem', borderTop: '1px solid #e5e7eb', paddingTop: '1rem'}}>
+                                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem'}}>
+                                        <div style={{fontSize: '0.8rem'}}>
+                                            <span>Total Packets: </span>
+                                            <b style={{color: '#22c55e'}}>{captureResult.total_packets}</b>
+                                        </div>
+                                        <a 
+                                            href={`${API_URL}/captures/${captureResult.filename}`} 
+                                            download 
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            style={{
+                                                fontSize: '0.75rem', color: '#fff', background: '#3f3f46', 
+                                                padding: '0.4rem 0.8rem', borderRadius: 6, textDecoration: 'none',
+                                                fontWeight: 700
+                                            }}
+                                        >
+                                            DOWNLOAD PCAP
+                                        </a>
+                                    </div>
+                                    <div style={{display: 'flex', flexWrap: 'wrap', gap: '0.4rem'}}>
+                                        {Object.entries(captureResult.protocols || {}).map(([proto, count]) => (
+                                            <span key={proto} style={{fontSize: '0.65rem', background: '#f1f1f1', padding: '0.2rem 0.5rem', borderRadius: 4}}>
+                                                {proto}: {count}
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
                         <h4>SERVICES</h4>
                         {selected.ports.map(p => (
                             <div key={p.port} style={{padding: '1rem', background: '#f4f4f5', border: '1px solid #e4e4e7', borderRadius: 12, borderLeft: '4px solid #22c55e', marginBottom: '0.8rem'}}>

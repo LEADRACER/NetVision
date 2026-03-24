@@ -1,8 +1,11 @@
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import asyncio
 import json
 from scanner import NetworkScanner
+from capturer import PacketCapturer
+from pydantic import BaseModel
 
 app = FastAPI(title="NetVision v2 API")
 
@@ -13,9 +16,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount captures directory for file downloads
+app.mount("/captures", StaticFiles(directory="captures"), name="captures")
+
 scanner = NetworkScanner()
+capturer = PacketCapturer(interface="wlan0") # Hardcoded from previous check
 latest_results = []
 is_scanning = False
+
+class CaptureRequest(BaseModel):
+    ip: str
+    duration: int = 10
 active_connections: list[WebSocket] = []
 
 class ConnectionManager:
@@ -86,6 +97,13 @@ async def run_scan_task(target: str, profile: str):
 @app.get("/devices")
 async def get_devices():
     return {"devices": latest_results, "is_scanning": is_scanning}
+
+@app.post("/capture")
+async def capture_packets(request: CaptureRequest):
+    # This is a blocking-style async call (it waits for the duration)
+    # But because it's an 'await' on a subprocess, it won't block the event loop
+    result = await capturer.capture_for_ip(request.ip, request.duration)
+    return result
 
 @app.get("/health")
 def health_check():
