@@ -34,3 +34,4 @@ MANIFEST
 Thumbs.db
 /tmp/
 *.log
+backend/captures/*.pcap
