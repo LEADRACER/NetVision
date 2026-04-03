@@ -57,6 +57,19 @@ NetVision is a high-performance, industrial-grade network mapping tool designed 
    npm run dev -- --host
    ```
 
+## Automation for your lazy mind
+
+### Execute in term...
+
+1. Give executable permission
+   ```bash
+   sudo chmod +x run.sh
+   ```
+2. Execute to start server
+   ```bash
+   sudo ./run.sh
+   ```
+
 ---
 
 ## 🛠️ Technology Stack
