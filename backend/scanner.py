@@ -97,6 +97,7 @@ class NetworkScanner:
             targets = [target]
         
         # If trace_hops enabled, traceroute first and add hop subnets
+        subnet_to_hop = {}  # map subnet -> hop count (TTL)
         if trace_hops and len(targets) == 1:
             hops = await self.traceroute(targets[0])
             hop_ips = [h['ip'] for h in hops if h['ip']]
@@ -106,7 +107,7 @@ class NetworkScanner:
                     hop_subnet = self._get_subnet_from_ip(hop['ip'])
                     if hop_subnet and hop_subnet not in subnet_to_hop:
                         subnet_to_hop[hop_subnet] = hop['ttl']
-            # Add hop subnets to targets list (deduped)
+            # Also add discovered hop subnets to targets list
             for subnet in subnet_to_hop:
                 if subnet not in targets:
                     targets.append(subnet)
