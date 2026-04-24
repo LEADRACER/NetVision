@@ -23,6 +23,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Ensure captures directory exists before mounting
+os.makedirs("captures", exist_ok=True)
 # Mount captures directory for file downloads
 app.mount("/captures", StaticFiles(directory="captures"), name="captures")
 
