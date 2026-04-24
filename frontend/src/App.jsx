@@ -132,9 +132,21 @@ const App = () => {
             <div className="sidebar">
                 {/* Sticky header with stats */}
                 <div className="sidebar-sticky">
-                    <div className="sidebar-header">
-                        <h1>NETVISION</h1>
-                        <p>NEUTRAL DISCOVERY v4.2</p>
+                    <div className="sidebar-sticky-header">
+                        <div className="sidebar-header">
+                            <h1>NETVISION</h1>
+                            <p>NEUTRAL DISCOVERY v4.2</p>
+                        </div>
+                        <div className="sidebar-sticky-actions">
+                            <button
+                                className="btn-refresh"
+                                onClick={() => window.location.reload()}
+                                title="Refresh page"
+                            >
+                                <RefreshCw size={12} />
+                                Refresh
+                            </button>
+                        </div>
                     </div>
 
                     <div className="sidebar-stats">
@@ -167,16 +179,6 @@ const App = () => {
                         </div>
                     )}
                 </div>
-
-                {/* Refresh button */}
-                <button
-                    className="btn-refresh"
-                    onClick={() => window.location.reload()}
-                    title="Refresh page"
-                >
-                    <RefreshCw size={12} />
-                    Refresh
-                </button>
 
                 {/* Devices list */}
                 <div className="devices-list">
