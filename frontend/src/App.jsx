@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Search, Activity, Zap } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Search, Activity, Zap, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import SidebarDeviceCard from './components/SidebarDeviceCard';
 import GridDeviceCard from './components/GridDeviceCard';
 
@@ -13,13 +13,39 @@ const App = () => {
     const [isCapturing, setIsCapturing] = useState(false);
     const [captureResult, setCaptureResult] = useState(null);
     const [captureDuration, setCaptureDuration] = useState(10);
+    const [connectionStatus, setConnectionStatus] = useState('connected'); // connected, connecting, disconnected
+    const [lastUpdate, setLastUpdate] = useState(null);
+    const [scanProgress, setScanProgress] = useState(0);
+    const lastUpdateRef = useRef(null);
+
+    // Track scan progress
+    useEffect(() => {
+        if (isScanning) {
+            const interval = setInterval(() => {
+                setScanProgress(prev => (prev < 100 ? prev + 2 : 100));
+            }, 500);
+            return () => clearInterval(interval);
+        } else {
+            setScanProgress(0);
+        }
+    }, [isScanning]);
+
+    // Update last update timestamp on device changes
+    useEffect(() => {
+        lastUpdateRef.current = new Date();
+        setLastUpdate(lastUpdateRef.current);
+    }, [devices]);
 
     useEffect(() => {
         let ws;
         let reconnectTimer;
 
         const connect = () => {
+            setConnectionStatus('connecting');
             ws = new WebSocket(WS_URL);
+            ws.onopen = () => {
+                setConnectionStatus('connected');
+            };
             ws.onmessage = (e) => {
                 const data = JSON.parse(e.data);
                 if (data.type === 'update') {
@@ -38,7 +64,11 @@ const App = () => {
                 }
             };
             ws.onclose = () => {
+                setConnectionStatus('disconnected');
                 reconnectTimer = setTimeout(connect, 5000);
+            };
+            ws.onerror = () => {
+                setConnectionStatus('disconnected');
             };
         };
 
@@ -49,6 +79,17 @@ const App = () => {
             if (ws) ws.close();
         };
     }, []);
+
+    // Keyboard shortcut to close overlay
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if (e.key === 'Escape' && selected) {
+                setSelected(null);
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [selected]);
 
     const runScan = useCallback(() => {
         fetch(`${API_URL}/scan?profile=deep`);
@@ -77,22 +118,76 @@ const App = () => {
         }
     }, [captureDuration]);
 
+    const formatTime = (date) => {
+        if (!date) return 'Never';
+        return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    };
+
+    const totalOpenPorts = devices.reduce((acc, d) => acc + d.ports.filter(p => p.state === 'open').length, 0);
+    const vulnCount = devices.filter(d => d.vulns_detected).length;
+
     return (
         <div className="app-container">
             {/* Sidebar */}
             <div className="sidebar">
-                <div className="sidebar-header">
-                    <h1>NETVISION</h1>
-                    <p>NEUTRAL DISCOVERY v4.2</p>
+                {/* Sticky header with stats */}
+                <div className="sidebar-sticky">
+                    <div className="sidebar-header">
+                        <h1>NETVISION</h1>
+                        <p>NEUTRAL DISCOVERY v4.2</p>
+                    </div>
+
+                    <div className="sidebar-stats">
+                        <div className="stat-item">
+                            <span className="stat-value">{devices.length}</span>
+                            <span className="stat-label-sm">NODES</span>
+                        </div>
+                        <div className="stat-item">
+                            <span className="stat-value">{totalOpenPorts}</span>
+                            <span className="stat-label-sm">OPEN PORTS</span>
+                        </div>
+                    </div>
+
+                    <div className="connection-status">
+                        {connectionStatus === 'connected' ? <Wifi size={12} /> : <WifiOff size={12} />}
+                        <span>{connectionStatus === 'connected' ? 'Connected' : connectionStatus === 'connecting' ? 'Connecting...' : 'Disconnected'}</span>
+                    </div>
                 </div>
 
-                <button className="btn-scan" onClick={runScan} disabled={isScanning}>
-                    {isScanning ? <Activity size={18} className="spin" /> : <Search size={18} />}
-                    {isScanning ? 'SCANNING...' : 'EXECUTE SCAN'}
+                {/* Scan button with progress */}
+                <div>
+                    <button className="btn-scan" onClick={runScan} disabled={isScanning}>
+                        {isScanning ? <Activity size={18} className="spin" /> : <Search size={18} />}
+                        {isScanning ? 'SCANNING...' : 'EXECUTE SCAN'}
+                    </button>
+
+                    {isScanning && (
+                        <div className="scan-progress-bar">
+                            <div className="scan-progress-fill" style={{width: `${scanProgress}%`}} />
+                        </div>
+                    )}
+                </div>
+
+                {/* Refresh button */}
+                <button
+                    className="btn-refresh"
+                    onClick={() => window.location.reload()}
+                    title="Refresh page"
+                >
+                    <RefreshCw size={12} />
+                    Refresh
                 </button>
 
+                {/* Devices list */}
                 <div className="devices-list">
-                    <p className="devices-count">NODES ({devices.length})</p>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                        <p className="devices-count">NODES ({devices.length})</p>
+                        {vulnCount > 0 && (
+                            <span style={{fontSize: '0.6rem', color: '#ef4444', fontWeight: 700}}>
+                                {vulnCount} ⚠
+                            </span>
+                        )}
+                    </div>
                     {devices.map(d => (
                         <SidebarDeviceCard
                             key={d.ip}
@@ -104,9 +199,17 @@ const App = () => {
                     {devices.length === 0 && !isScanning && (
                         <div className="empty-state">
                             <p>No devices detected</p>
+                            <p style={{fontSize: '0.6rem', marginTop: '0.5rem'}}>Click "Execute Scan" to begin</p>
                         </div>
                     )}
                 </div>
+
+                {/* Last update */}
+                {lastUpdate && (
+                    <div className="last-update">
+                        Last update: {formatTime(lastUpdate)}
+                    </div>
+                )}
             </div>
 
             {/* Main Map Area */}
@@ -121,102 +224,146 @@ const App = () => {
                     ))}
                     {devices.length === 0 && !isScanning && (
                         <div className="empty-state-large">
-                            <p>Passive Monitor Online</p>
+                            <Wifi size={64} style={{marginBottom: '1rem', opacity: 0.3}} />
+                            <h2 style={{fontWeight: 300, color: '#71717a'}}>Passive Monitor Online</h2>
+                            <p style={{fontSize: '0.8rem', color: '#a1a1aa', marginTop: '0.5rem'}}>Waiting for scan results...</p>
                         </div>
                     )}
                 </div>
             </div>
 
-            {/* Details Overlay */}
+            {/* Details Overlay with backdrop */}
             {selected && (
-                <div className="details-overlay">
-                    <div className="details-header">
-                        <div>
-                            <h2>{selected.ip}</h2>
-                            <p>{selected.vendor}</p>
-                        </div>
-                        <button className="details-close" onClick={() => setSelected(null)}>✕</button>
-                    </div>
-
-                    <div className="details-body">
-                        <div className="stats-grid">
-                            <div className="stat-box">
-                                <p className="stat-label">OS</p>
-                                <b>{selected.os || 'Unknown'}</b>
+                <>
+                    <div className="overlay-backdrop" onClick={() => setSelected(null)} />
+                    <div className="details-overlay">
+                        <div className="details-header">
+                            <div>
+                                <h2>{selected.ip}</h2>
+                                <p>{selected.vendor}</p>
                             </div>
-                            <div className="stat-box">
-                                <p className="stat-label">LATENCY</p>
-                                <b>{selected.latency_ms ? selected.latency_ms.toFixed(2) : "0.00"} ms</b>
-                            </div>
+                            <button className="details-close" onClick={() => setSelected(null)} title="Close (ESC)">✕</button>
                         </div>
 
-                        <div className="capture-section">
-                            <div className="capture-header">
-                                <h4 className="section-title">PACKET CAPTURE ENGINE</h4>
-                                <Zap size={16} color={isCapturing ? '#eab308' : '#71717a'} />
+                        <div className="details-body">
+                            <div className="stats-grid">
+                                <div className="stat-box">
+                                    <p className="stat-label">OS</p>
+                                    <b title={selected.os}>{selected.os || 'Unknown'}</b>
+                                </div>
+                                <div className="stat-box">
+                                    <p className="stat-label">LATENCY</p>
+                                    <b>{selected.latency_ms ? selected.latency_ms.toFixed(2) : "0.00"} ms</b>
+                                </div>
+                                <div className="stat-box">
+                                    <p className="stat-label">DISTANCE</p>
+                                    <b>{selected.distance || 1} hop{selected.distance !== 1 ? 's' : ''}</b>
+                                </div>
+                                <div className="stat-box">
+                                    <p className="stat-label">ACTIVE PORTS</p>
+                                    <b>{selected.ports.filter(p => p.state === 'open').length}</b>
+                                </div>
                             </div>
 
-                            <div className="capture-controls">
-                                <input
-                                    type="range"
-                                    min="5"
-                                    max="60"
-                                    value={captureDuration}
-                                    onChange={(e) => setCaptureDuration(parseInt(e.target.value))}
-                                    className="capture-slider"
-                                />
-                                <span className="capture-duration">{captureDuration}s</span>
-                            </div>
+                            <div className="capture-section">
+                                <div className="capture-header">
+                                    <h4 className="section-title">PACKET CAPTURE ENGINE</h4>
+                                    <Zap size={16} color={isCapturing ? '#eab308' : '#71717a'} />
+                                </div>
 
-                            <button
-                                onClick={() => handleCapture(selected.ip)}
-                                disabled={isCapturing}
-                                className="capture-btn"
-                            >
-                                {isCapturing ? 'CAPTURING TRAFFIC...' : 'START TSHARK CAPTURE'}
-                            </button>
+                                <div className="capture-controls">
+                                    <input
+                                        type="range"
+                                        min="5"
+                                        max="60"
+                                        value={captureDuration}
+                                        onChange={(e) => setCaptureDuration(parseInt(e.target.value))}
+                                        className="capture-slider"
+                                    />
+                                    <span className="capture-duration">{captureDuration}s</span>
+                                </div>
 
-                            {captureResult && !isCapturing && (
-                                <div className="capture-result">
-                                    <div className="result-row">
-                                        <div>
-                                            <span>Total Packets: </span>
-                                            <b style={{color: '#22c55e'}}>{captureResult.total_packets}</b>
+                                <button
+                                    onClick={() => handleCapture(selected.ip)}
+                                    disabled={isCapturing}
+                                    className="capture-btn"
+                                >
+                                    {isCapturing ? 'CAPTURING TRAFFIC...' : 'START TSHARK CAPTURE'}
+                                </button>
+
+                                {isCapturing && (
+                                    <div className="scan-overlay">
+                                        <div className="scan-overlay-content">
+                                            <div className="scan-overlay-spinner" />
+                                            <p className="scan-overlay-text">Capturing packets...</p>
                                         </div>
-                                        <a
-                                            href={`${API_URL}/captures/${captureResult.filename}`}
-                                            download
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="result-download"
-                                        >
-                                            DOWNLOAD PCAP
-                                        </a>
                                     </div>
-                                    <div className="protocol-tags">
-                                        {Object.entries(captureResult.protocols || {}).map(([proto, count]) => (
-                                            <span key={proto} className="protocol-tag">
-                                                {proto}: {count}
-                                            </span>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-                        </div>
+                                )}
 
-                        <h4 className="section-title">SERVICES</h4>
-                        <div className="services-list">
-                            {selected.ports.map(p => (
-                                <div key={p.port} className="service-item">
-                                    <div>
-                                        <b>{p.port}/{p.protocol}</b>
-                                        <div style={{fontSize: '0.8rem', color: '#71717a'}}>{p.service}</div>
+                                {captureResult && !isCapturing && (
+                                    <div className="capture-result">
+                                        <div className="result-row">
+                                            <div>
+                                                <span>Total Packets: </span>
+                                                <b style={{color: '#22c55e'}}>{captureResult.total_packets}</b>
+                                            </div>
+                                            <div style={{fontSize: '0.75rem', color: '#71717a'}}>
+                                                {captureResult.total_bytes.toLocaleString()} bytes
+                                            </div>
+                                        </div>
+                                        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem'}}>
+                                            <span style={{fontSize: '0.8rem'}}>Protocol Distribution:</span>
+                                            <a
+                                                href={`${API_URL}/captures/${captureResult.filename}`}
+                                                download
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="result-download"
+                                            >
+                                                DOWNLOAD PCAP
+                                            </a>
+                                        </div>
+                                        <div className="protocol-tags">
+                                            {Object.entries(captureResult.protocols || {}).map(([proto, count]) => {
+                                                const percentage = Math.round((count / (captureResult.total_packets || 1)) * 100);
+                                                return (
+                                                    <span key={proto} className="protocol-tag" title={`${percentage}% of traffic`}>
+                                                        <strong>{proto}</strong>: {count}
+                                                    </span>
+                                                );
+                                            })}
+                                        </div>
                                     </div>
-                                </div>
-                            ))}
+                                )}
+                            </div>
+
+                            <h4 className="section-title">SERVICES ({selected.ports.length})</h4>
+                            <div className="services-list">
+                                {selected.ports.map(p => {
+                                    const isOpen = p.state === 'open';
+                                    return (
+                                        <div
+                                            key={`${p.port}-${p.protocol}`}
+                                            className="service-item"
+                                            style={{borderLeftColor: isOpen ? 'var(--accent-green)' : '#71717a'}}
+                                        >
+                                            <div>
+                                                <b>{p.port}/{p.protocol}</b>
+                                                <div style={{fontSize: '0.8rem', color: '#71717a'}}>
+                                                    {p.service || 'unknown'}
+                                                    {p.version && ` ${p.version}`}
+                                                </div>
+                                            </div>
+                                            <span className={`port-tag ${isOpen ? 'important' : ''}`} style={{alignSelf: 'center'}}>
+                                                {p.state}
+                                            </span>
+                                        </div>
+                                    );
+                                })}
+                            </div>
                         </div>
                     </div>
-                </div>
+                </>
             )}
         </div>
     );

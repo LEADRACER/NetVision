@@ -343,66 +343,320 @@ body {
   border-radius: 4px;
 }
 
-.service-item {
-  padding: 1rem;
-  background: #f4f4f5;
-  border: 1px solid #e4e4e7;
-  border-radius: 12px;
-  border-left: 4px solid var(--accent-green);
-  margin-bottom: 0.8rem;
-  display: flex;
-  justify-content: space-between;
+/* Sidebar sticky header with stats */
+.sidebar-sticky {
+  position: sticky;
+  top: 0;
+  background: var(--sidebar-bg);
+  padding: 1rem 0;
+  margin: 0 -2rem 1rem -2rem;
+  padding-left: 2rem;
+  padding-right: 2rem;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+  z-index: 10;
 }
 
-/* Additional utility classes */
-.sidebar-header {
-  margin-bottom: 2rem;
+.sidebar-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-top: 0.5rem;
 }
 
-.sidebar-header h1 {
-  font-family: 'Space Grotesk', sans-serif;
-  font-size: 1.8rem;
-  letter-spacing: -1px;
-  color: #fff;
-  margin: 0;
-}
-
-.sidebar-header p {
-  color: #d4d4d8;
-  font-size: 0.7rem;
-  font-weight: 600;
-  margin: 0;
-}
-
-.devices-list {
-  overflow-y: auto;
-  flex: 1;
-}
-
-.devices-count {
-  font-size: 0.7rem;
-  color: #d4d4d8;
-  font-weight: 800;
-  margin-bottom: 1rem;
-}
-
-.empty-state,
-.empty-state-large {
+.stat-item {
   text-align: center;
-  opacity: 0.2;
-  padding: 2rem;
 }
 
-.empty-state-large {
-  grid-column: 1/-1;
-  padding: 10rem 0;
+.stat-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #fff;
+  display: block;
 }
 
-.spin {
+.stat-label-sm {
+  font-size: 0.6rem;
+  color: #d4d4d8;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Scan progress bar */
+.scan-progress-bar {
+  height: 4px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 0.8rem;
+}
+
+.scan-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-green), #4ade80);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* Connection status indicator */
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.65rem;
+  color: #d4d4d8;
+  margin-top: 0.5rem;
+}
+
+.connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-green);
+}
+
+.connection-dot.connecting {
+  background: #eab308;
+  animation: blink 1s infinite;
+}
+
+.connection-dot.disconnected {
+  background: var(--accent-red);
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Device card entrance animation */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.device-card {
+  animation: fadeInUp 0.3s ease-out forwards;
+}
+
+.device-card:nth-child(1) { animation-delay: 0.05s; }
+.device-card:nth-child(2) { animation-delay: 0.1s; }
+.device-card:nth-child(3) { animation-delay: 0.15s; }
+.device-card:nth-child(4) { animation-delay: 0.2s; }
+.device-card:nth-child(5) { animation-delay: 0.25s; }
+/* Continue pattern for more items */
+.device-card:nth-child(n+6) { animation-delay: 0.3s; }
+
+/* Grid card animations */
+.grid-card {
+  animation: fadeInUp 0.3s ease-out forwards;
+  opacity: 0;
+}
+
+.grid-card:nth-child(1) { animation-delay: 0.05s; }
+.grid-card:nth-child(2) { animation-delay: 0.1s; }
+.grid-card:nth-child(3) { animation-delay: 0.15s; }
+.grid-card:nth-child(4) { animation-delay: 0.2s; }
+.grid-card:nth-child(5) { animation-delay: 0.25s; }
+.grid-card:nth-child(n+6) { animation-delay: 0.3s; }
+
+/* Enhanced grid card with ports count */
+.grid-card {
+  position: relative;
+}
+
+.grid-card-ports-badge {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  background: var(--sidebar-bg);
+  color: var(--text-light);
+  font-size: 0.6rem;
+  font-weight: 700;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+}
+
+.grid-card-os {
+  font-size: 0.7rem;
+  color: #71717a;
+  margin-top: 0.5rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Refresh button */
+.btn-refresh {
+  position: absolute;
+  top: 1.5rem;
+  right: 1.5rem;
+  background: var(--sidebar-bg);
+  color: var(--text-light);
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  z-index: 50;
+  transition: all 0.2s;
+}
+
+.btn-refresh:hover {
+  background: #71717a;
+}
+
+/* Last update indicator */
+.last-update {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  font-size: 0.6rem;
+  color: #71717a;
+}
+
+/* Overlay backdrop */
+.overlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.3);
+  z-index: 999;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Loading overlay for scan */
+.scan-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255,255,255,0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  border-radius: 12px;
+}
+
+.scan-overlay-content {
+  text-align: center;
+}
+
+.scan-overlay-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid #e4e4e7;
+  border-top-color: var(--accent-green);
+  border-radius: 50%;
   animation: spin 1s linear infinite;
+  margin: 0 auto 1rem;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
+.scan-overlay-text {
+  font-size: 0.7rem;
+  color: #71717a;
+  font-weight: 600;
 }
+
+/* Tooltip */
+.tooltip {
+  position: relative;
+  cursor: help;
+}
+
+.tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #18181b;
+  color: #fff;
+  padding: 0.5rem 0.8rem;
+  border-radius: 6px;
+  font-size: 0.6rem;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+  z-index: 1000;
+}
+
+.tooltip:hover::after {
+  opacity: 1;
+}
+
+/* Protocol badge sizes */
+.port-tag {
+  font-size: 0.6rem;
+  border: 1px solid #e4e4e7;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  color: #52525b;
+}
+
+.port-tag.important {
+  background: #fef3c7;
+  border-color: #f59e0b;
+  color: #92400e;
+}
+
+/* Health indicator in sidebar */
+.health-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.6rem;
+  color: #d4d4d8;
+  margin-top: 0.5rem;
+}
+
+.health-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-green);
+}
+
+.health-dot.warning {
+  background: #eab308;
+}
+
+.health-dot.error {
+  background: var(--accent-red);
+}
+
+/* Overlay backdrop */
+.overlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.3);
+  z-index: 999;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+
 
