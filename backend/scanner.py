@@ -46,17 +46,14 @@ class NetworkScanner:
         # Handle multiple targets (comma-separated or "all" keyword)
         targets = []
         if target.lower() == "all":
-            # Common private /24 subnets
-            for octet1 in [10, 192, 172]:
-                if octet1 == 10:
-                    for i in range(256):
-                        targets.append(f"10.{i}.0.0/24")
-                elif octet1 == 172:
-                    for i in range(16, 32):
-                        targets.append(f"172.{i}.0.0/24")
-                elif octet1 == 192:
-                    for i in range(256):
-                        targets.append(f"192.168.{i}.0/24")
+            # Most common home/office /24 subnets (not exhaustive RFC1918 to avoid hours-long scans)
+            targets = [
+                "192.168.0.0/24",
+                "192.168.1.0/24",
+                "192.168.2.0/24",
+                "10.0.0.0/24",
+                "172.16.0.0/24"
+            ]
         elif ',' in target:
             targets = [t.strip() for t in target.split(',')]
         else:
