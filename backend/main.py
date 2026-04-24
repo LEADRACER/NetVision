@@ -80,20 +80,19 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 @app.get("/scan")
-async def start_scan(background_tasks: BackgroundTasks, target: str = None, profile: str = "deep", duration: int = None):
+async def start_scan(background_tasks: BackgroundTasks, target: str = None, profile: str = "deep", duration: int = None, trace_hops: bool = False):
     global is_scanning
     if is_scanning:
         return {"status": "scanning", "message": "Scan already in progress"}
     
     is_scanning = True
     await manager.broadcast({"type": "status", "is_scanning": True})
-    background_tasks.add_task(run_scan_task, target, profile, duration)
+    background_tasks.add_task(run_scan_task, target, profile, duration, trace_hops)
     return {"status": "started", "message": f"Scan started on {target if target else 'local subnet'}"}
 
-async def run_scan_task(target: str, profile: str, duration: int = None):
+async def run_scan_task(target: str, profile: str, duration: int = None, trace_hops: bool = False):
     global latest_results, is_scanning
     
-    # Callback to stream results chunk-by-chunk
     async def progress_callback(chunk_results):
         global latest_results
         existing_ips = {d['ip'] for d in latest_results}
@@ -104,12 +103,11 @@ async def run_scan_task(target: str, profile: str, duration: int = None):
                 latest_results.append(res)
         asyncio.create_task(manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True}))
     
-    # Callback for subnet start
     async def subnet_callback(subnet):
         asyncio.create_task(manager.broadcast({"type": "subnet_start", "subnet": subnet}))
 
     try:
-        await scanner.scan_network(target, profile, progress_callback, duration, subnet_callback)
+        await scanner.scan_network(target, profile, progress_callback, duration, subnet_callback, trace_hops)
     finally:
         is_scanning = False
         await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})

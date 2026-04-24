@@ -27,8 +27,28 @@ const GridDeviceCard = memo(function GridDeviceCard({ device, onClick }) {
                     {device.vulns_detected ? <ShieldAlert size={24} color="#ef4444" /> : <Shield size={24} color="#22c55e" />}
                 </div>
                 <div>
-                    <h3 className="grid-card-title">{device.ip}</h3>
-                    <p className="grid-card-subtitle">{device.vendor}</p>
+                    <h3 className="grid-card-title">
+                        {device.ip}
+                        {device.hop_count !== null && device.hop_count !== undefined && (
+                            <span style={{
+                                fontSize: '0.7rem',
+                                fontWeight: 400,
+                                color: '#3b82f6',
+                                marginLeft: '0.5rem',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '0.15rem'
+                            }}>
+                                ↗ {device.hop_count}
+                            </span>
+                        )}
+                    </h3>
+                    <p className="grid-card-subtitle">
+                        {device.vendor}
+                        {device.hop_count !== null && device.hop_count !== undefined && (
+                            <span style={{color: '#3b82f6'}}> · {device.hop_count} hop{device.hop_count !== 1 ? 's' : ''} away</span>
+                        )}
+                    </p>
                     {device.os && device.os !== 'Unknown' && (
                         <p className="grid-card-os" title={device.os}>{device.os}</p>
                     )}

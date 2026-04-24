@@ -14,8 +14,9 @@ const App = () => {
     const [captureResult, setCaptureResult] = useState(null);
     const [captureDuration, setCaptureDuration] = useState(10);
     const [scanDuration, setScanDuration] = useState(null);
-    const [scanTarget, setScanTarget] = useState(''); // Custom target input
-    const [scanAll, setScanAll] = useState(false); // All subnets flag
+    const [scanTarget, setScanTarget] = useState('');
+    const [scanAll, setScanAll] = useState(false);
+    const [traceHops, setTraceHops] = useState(false); // Traceroute hop scanning
     const [connectionStatus, setConnectionStatus] = useState('connected');
     const [lastUpdate, setLastUpdate] = useState(null);
     const [scanProgress, setScanProgress] = useState(0);
@@ -98,11 +99,13 @@ const App = () => {
     }, [selected]);
 
     const runScan = useCallback(() => {
-        // API_URL is a stable constant, safe to use without being a dependency
         const url = new URL(`${API_URL}/scan`);
         url.searchParams.set('profile', 'deep');
         if (scanDuration) {
             url.searchParams.set('duration', scanDuration);
+        }
+        if (traceHops) {
+            url.searchParams.set('trace_hops', 'true');
         }
         const target = scanAll ? 'all' : scanTarget.trim();
         if (target) {
@@ -111,7 +114,7 @@ const App = () => {
         fetch(url.toString());
         setIsScanning(true);
         setCurrentSubnet('');
-    }, [scanDuration, scanTarget, scanAll]); // API_URL omitted — constant // API_URL is stable constant, okay to include
+    }, [API_URL, scanDuration, scanTarget, scanAll, traceHops]); // API_URL stable but OK // API_URL is stable constant, okay to include
 
     const handleSelect = useCallback((device) => {
         setSelected(device);
@@ -226,6 +229,39 @@ const App = () => {
                                 transition: 'border-color 0.2s'
                             }}
                         />
+                    </div>
+
+                    {/* Trace hops toggle */}
+                    <div style={{marginBottom: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem'}}>
+                        <label style={{fontSize: '0.7rem', color: '#d4d4d8', fontWeight: 600}}>TRACE HOPS</label>
+                        <button
+                            type="button"
+                            onClick={() => setTraceHops(!traceHops)}
+                            style={{
+                                flexShrink: 0,
+                                width: '44px',
+                                height: '24px',
+                                borderRadius: '12px',
+                                border: 'none',
+                                background: traceHops ? 'var(--accent-green)' : '#52525b',
+                                cursor: 'pointer',
+                                position: 'relative',
+                                transition: 'background 0.2s',
+                                padding: 0
+                            }}
+                        >
+                            <span style={{
+                                position: 'absolute',
+                                left: traceHops ? '24px' : '2px',
+                                top: '2px',
+                                width: '20px',
+                                height: '20px',
+                                borderRadius: '50%',
+                                background: '#fff',
+                                transition: 'left 0.2s',
+                                display: 'block'
+                            }} />
+                        </button>
                     </div>
 
                     {/* Duration selector */}
