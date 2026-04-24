@@ -13,10 +13,13 @@ const App = () => {
     const [isCapturing, setIsCapturing] = useState(false);
     const [captureResult, setCaptureResult] = useState(null);
     const [captureDuration, setCaptureDuration] = useState(10);
-    const [scanDuration, setScanDuration] = useState(null); // null = unlimited (profile-based)
-    const [connectionStatus, setConnectionStatus] = useState('connected'); // connected, connecting, disconnected
+    const [scanDuration, setScanDuration] = useState(null);
+    const [scanTarget, setScanTarget] = useState(''); // Custom target input
+    const [scanAll, setScanAll] = useState(false); // All subnets flag
+    const [connectionStatus, setConnectionStatus] = useState('connected');
     const [lastUpdate, setLastUpdate] = useState(null);
     const [scanProgress, setScanProgress] = useState(0);
+    const [currentSubnet, setCurrentSubnet] = useState('');
     const lastUpdateRef = useRef(null);
 
     // Track scan progress
@@ -62,6 +65,8 @@ const App = () => {
                 } else if (data.type === 'status') {
                     setIsScanning(data.is_scanning);
                     if (data.devices) setDevices(data.devices);
+                } else if (data.type === 'subnet_start') {
+                    setCurrentSubnet(data.subnet);
                 }
             };
             ws.onclose = () => {
@@ -93,14 +98,20 @@ const App = () => {
     }, [selected]);
 
     const runScan = useCallback(() => {
+        // API_URL is a stable constant, safe to use without being a dependency
         const url = new URL(`${API_URL}/scan`);
         url.searchParams.set('profile', 'deep');
         if (scanDuration) {
             url.searchParams.set('duration', scanDuration);
         }
+        const target = scanAll ? 'all' : scanTarget.trim();
+        if (target) {
+            url.searchParams.set('target', target);
+        }
         fetch(url.toString());
         setIsScanning(true);
-    }, [scanDuration]);
+        setCurrentSubnet('');
+    }, [scanDuration, scanTarget, scanAll]); // API_URL omitted — constant // API_URL is stable constant, okay to include
 
     const handleSelect = useCallback((device) => {
         setSelected(device);
@@ -174,17 +185,61 @@ const App = () => {
 
                 {/* Scan button with progress */}
                 <div>
-                    {/* Duration selector */}
+                    {/* Target input */}
                     <div style={{marginBottom: '0.75rem'}}>
-                        <select
-                            value={scanDuration || ''}
-                            onChange={(e) => setScanDuration(e.target.value ? parseInt(e.target.value) : null)}
+                        <div style={{display: 'flex', gap: '0.5rem', marginBottom: '0.5rem'}}>
+                            <button
+                                type="button"
+                                onClick={() => { setScanAll(true); setScanTarget(''); }}
+                                style={{
+                                    flex: 1,
+                                    padding: '0.5rem',
+                                    borderRadius: '6px',
+                                    border: scanAll ? '1px solid var(--accent-green)' : '1px solid #71717a',
+                                    background: scanAll ? 'rgba(34, 197, 94, 0.1)' : 'transparent',
+                                    color: scanAll ? 'var(--accent-green)' : '#d4d4d8',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 700,
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s'
+                                }}
+                            >
+                                ALL SUBNETS
+                            </button>
+                        </div>
+                        <input
+                            type="text"
+                            placeholder={scanAll ? "Scanning all private subnets..." : "e.g., 192.168.1.0/24 or 192.168.1.1"}
+                            value={scanTarget}
+                            onChange={(e) => { setScanTarget(e.target.value); setScanAll(false); }}
+                            disabled={isScanning}
                             style={{
                                 width: '100%',
                                 padding: '0.625rem 0.75rem',
                                 borderRadius: '8px',
                                 border: '1px solid #71717a',
-                                background: '#52525b',
+                                background: isScanning ? '#3f3f46' : '#52525b',
+                                color: '#fff',
+                                fontSize: '0.75rem',
+                                fontFamily: 'Inter, sans-serif',
+                                outline: 'none',
+                                transition: 'border-color 0.2s'
+                            }}
+                        />
+                    </div>
+
+                    {/* Duration selector */}
+                    <div style={{marginBottom: '0.75rem'}}>
+                        <select
+                            value={scanDuration || ''}
+                            onChange={(e) => setScanDuration(e.target.value ? parseInt(e.target.value) : null)}
+                            disabled={isScanning}
+                            style={{
+                                width: '100%',
+                                padding: '0.625rem 0.75rem',
+                                borderRadius: '8px',
+                                border: '1px solid #71717a',
+                                background: isScanning ? '#3f3f46' : '#52525b',
                                 color: '#fff',
                                 fontSize: '0.75rem',
                                 fontFamily: 'Inter, sans-serif',
@@ -206,6 +261,23 @@ const App = () => {
                     {isScanning && (
                         <div className="scan-progress-bar">
                             <div className="scan-progress-fill" style={{width: `${scanProgress}%`}} />
+                        </div>
+                    )}
+
+                    {/* Current subnet indicator */}
+                    {isScanning && currentSubnet && (
+                        <div style={{
+                            marginTop: '0.75rem',
+                            fontSize: '0.65rem',
+                            color: '#d4d4d8',
+                            textAlign: 'center',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '0.5rem'
+                        }}>
+                            <Wifi size={10} />
+                            <span>{currentSubnet}</span>
                         </div>
                     )}
                 </div>

@@ -96,20 +96,20 @@ async def run_scan_task(target: str, profile: str, duration: int = None):
     # Callback to stream results chunk-by-chunk
     async def progress_callback(chunk_results):
         global latest_results
-        # Update/Append results
         existing_ips = {d['ip'] for d in latest_results}
         for res in chunk_results:
             if res['ip'] in existing_ips:
-                # Update existing
                 latest_results = [res if d['ip'] == res['ip'] else d for d in latest_results]
             else:
                 latest_results.append(res)
-        
-        # Fire-and-forget broadcast to avoid blocking scan progress
         asyncio.create_task(manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True}))
+    
+    # Callback for subnet start
+    async def subnet_callback(subnet):
+        asyncio.create_task(manager.broadcast({"type": "subnet_start", "subnet": subnet}))
 
     try:
-        await scanner.scan_network(target, profile, progress_callback, duration)
+        await scanner.scan_network(target, profile, progress_callback, duration, subnet_callback)
     finally:
         is_scanning = False
         await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})

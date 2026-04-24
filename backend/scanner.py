@@ -39,60 +39,83 @@ class NetworkScanner:
             print(f"Error getting subnet for {interface}: {e}")
             return "192.168.1.0/24"
 
-    async def scan_network(self, target=None, profile="deep", callback=None, duration=None):
+    async def scan_network(self, target=None, profile="deep", callback=None, duration=None, subnet_callback=None):
         if not target:
             target = self.get_local_subnet()
+        
+        # Handle multiple targets (comma-separated or "all" keyword)
+        targets = []
+        if target.lower() == "all":
+            # Common private /24 subnets
+            for octet1 in [10, 192, 172]:
+                if octet1 == 10:
+                    for i in range(256):
+                        targets.append(f"10.{i}.0.0/24")
+                elif octet1 == 172:
+                    for i in range(16, 32):
+                        targets.append(f"172.{i}.0.0/24")
+                elif octet1 == 192:
+                    for i in range(256):
+                        targets.append(f"192.168.{i}.0/24")
+        elif ',' in target:
+            targets = [t.strip() for t in target.split(',')]
+        else:
+            targets = [target]
         
         # Profile mappings
         profiles = {
             "quick": "-T5 -F --max-retries 1",
             "deep": "-T4 -O -sV",
-            "security": "-T4 -O -sV --script vuln",
-            "30s": "-T4 --max-rtt-timeout 300ms --min-rtt-timeout 100ms --host-timeout 30s",
-            "1min": "-T4 --max-rtt-timeout 500ms --min-rtt-timeout 200ms --host-timeout 60s"
+            "security": "-T4 -O -sV --script vuln"
         }
+        base_args = profiles.get(profile, profiles["deep"])
         
-        args = profiles.get(profile, profiles["deep"])
-        
-        # Override with duration-based args if duration is specified
+        # Apply duration-based timeouts if specified
         if duration:
             try:
                 dur_sec = int(duration)
-                args = f"-T4 --max-rtt-timeout {max(100, dur_sec * 10)}ms --min-rtt-timeout 50ms --host-timeout {dur_sec}s"
+                max_rtt = min(2000, max(100, dur_sec * 8))
+                base_args += f" --max-rtt-timeout {max_rtt}ms --min-rtt-timeout 50ms --host-timeout {dur_sec}s"
             except ValueError:
                 pass
         
-        print(f"[*] Starting {profile} scan on {target} (args: {args})...")
+        print(f"[*] Starting {profile} scan on {len(targets)} subnet(s)...")
         
-        # For /24 or larger, we'll chunk the scan to provide progressive results
-        if target.endswith("/24"):
-            base_ip = ".".join(target.split(".")[:-1])
-            # Scan in chunks of 16 IPs for better responsiveness
-            for start in range(1, 255, 16):
-                end = min(start + 15, 254)
-                chunk_target = f"{base_ip}.{start}-{end}"
-                
+        # Scan each target sequentially
+        for idx, subnet in enumerate(targets):
+            print(f"[*] Scanning subnet {idx + 1}/{len(targets)}: {subnet}")
+            
+            # Notify about new subnet
+            if subnet_callback:
+                asyncio.create_task(subnet_callback(subnet))
+            
+            # For /24 or larger, chunk the scan
+            if subnet.endswith("/24"):
+                base_ip = ".".join(subnet.split(".")[:-1])
+                for start in range(1, 255, 16):
+                    end = min(start + 15, 254)
+                    chunk_target = f"{base_ip}.{start}-{end}"
+                    
+                    loop = asyncio.get_event_loop()
+                    try:
+                        scan_data = await loop.run_in_executor(None, lambda: self.nm.scan(hosts=chunk_target, arguments=base_args))
+                        results = self.parse_results(scan_data)
+                        if callback and results:
+                            await callback(results)
+                    except Exception as e:
+                        print(f"[!] Chunk {chunk_target} failed: {e}")
+            else:
+                # Single host or custom range
                 loop = asyncio.get_event_loop()
                 try:
-                    scan_data = await loop.run_in_executor(None, lambda: self.nm.scan(hosts=chunk_target, arguments=args))
+                    scan_data = await loop.run_in_executor(None, lambda: self.nm.scan(hosts=subnet, arguments=base_args))
                     results = self.parse_results(scan_data)
-                    if callback:
+                    if callback and results:
                         await callback(results)
                 except Exception as e:
-                    print(f"[!] Chunk {chunk_target} failed: {e}")
-            return {"status": "complete"}
-        else:
-            # Single host or small range
-            loop = asyncio.get_event_loop()
-            try:
-                scan_data = await loop.run_in_executor(None, lambda: self.nm.scan(hosts=target, arguments=args))
-                results = self.parse_results(scan_data)
-                if callback:
-                    await callback(results)
-                return results
-            except Exception as e:
-                print(f"[!] Scan failed: {e}")
-                return {"error": str(e)}
+                    print(f"[!] Scan of {subnet} failed: {e}")
+        
+        return {"status": "complete", "subnets_scanned": len(targets)}
 
     def parse_results(self, scan_data):
         devices = []
