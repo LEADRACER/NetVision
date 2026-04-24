@@ -13,6 +13,7 @@ const App = () => {
     const [isCapturing, setIsCapturing] = useState(false);
     const [captureResult, setCaptureResult] = useState(null);
     const [captureDuration, setCaptureDuration] = useState(10);
+    const [scanDuration, setScanDuration] = useState(null); // null = unlimited (profile-based)
     const [connectionStatus, setConnectionStatus] = useState('connected'); // connected, connecting, disconnected
     const [lastUpdate, setLastUpdate] = useState(null);
     const [scanProgress, setScanProgress] = useState(0);
@@ -92,9 +93,14 @@ const App = () => {
     }, [selected]);
 
     const runScan = useCallback(() => {
-        fetch(`${API_URL}/scan?profile=deep`);
+        const url = new URL(`${API_URL}/scan`);
+        url.searchParams.set('profile', 'deep');
+        if (scanDuration) {
+            url.searchParams.set('duration', scanDuration);
+        }
+        fetch(url.toString());
         setIsScanning(true);
-    }, []);
+    }, [scanDuration]);
 
     const handleSelect = useCallback((device) => {
         setSelected(device);
@@ -168,6 +174,30 @@ const App = () => {
 
                 {/* Scan button with progress */}
                 <div>
+                    {/* Duration selector */}
+                    <div style={{marginBottom: '0.75rem'}}>
+                        <select
+                            value={scanDuration || ''}
+                            onChange={(e) => setScanDuration(e.target.value ? parseInt(e.target.value) : null)}
+                            style={{
+                                width: '100%',
+                                padding: '0.625rem 0.75rem',
+                                borderRadius: '8px',
+                                border: '1px solid #71717a',
+                                background: '#52525b',
+                                color: '#fff',
+                                fontSize: '0.75rem',
+                                fontFamily: 'Inter, sans-serif',
+                                cursor: 'pointer',
+                                outline: 'none'
+                            }}
+                        >
+                            <option value="" style={{background: '#52525b', color: '#fff'}}>Duration: Unlimited</option>
+                            <option value="30" style={{background: '#52525b', color: '#fff'}}>30 seconds</option>
+                            <option value="60" style={{background: '#52525b', color: '#fff'}}>1 minute</option>
+                        </select>
+                    </div>
+
                     <button className="btn-scan" onClick={runScan} disabled={isScanning}>
                         {isScanning ? <Activity size={18} className="spin" /> : <Search size={18} />}
                         {isScanning ? 'SCANNING...' : 'EXECUTE SCAN'}

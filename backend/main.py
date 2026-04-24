@@ -80,17 +80,17 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 @app.get("/scan")
-async def start_scan(background_tasks: BackgroundTasks, target: str = None, profile: str = "deep"):
+async def start_scan(background_tasks: BackgroundTasks, target: str = None, profile: str = "deep", duration: int = None):
     global is_scanning
     if is_scanning:
         return {"status": "scanning", "message": "Scan already in progress"}
     
     is_scanning = True
     await manager.broadcast({"type": "status", "is_scanning": True})
-    background_tasks.add_task(run_scan_task, target, profile)
+    background_tasks.add_task(run_scan_task, target, profile, duration)
     return {"status": "started", "message": f"Scan started on {target if target else 'local subnet'}"}
 
-async def run_scan_task(target: str, profile: str):
+async def run_scan_task(target: str, profile: str, duration: int = None):
     global latest_results, is_scanning
     
     # Callback to stream results chunk-by-chunk
@@ -109,7 +109,7 @@ async def run_scan_task(target: str, profile: str):
         asyncio.create_task(manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True}))
 
     try:
-        await scanner.scan_network(target, profile, progress_callback)
+        await scanner.scan_network(target, profile, progress_callback, duration)
     finally:
         is_scanning = False
         await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})

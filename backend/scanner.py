@@ -39,7 +39,7 @@ class NetworkScanner:
             print(f"Error getting subnet for {interface}: {e}")
             return "192.168.1.0/24"
 
-    async def scan_network(self, target=None, profile="deep", callback=None):
+    async def scan_network(self, target=None, profile="deep", callback=None, duration=None):
         if not target:
             target = self.get_local_subnet()
         
@@ -47,11 +47,22 @@ class NetworkScanner:
         profiles = {
             "quick": "-T5 -F --max-retries 1",
             "deep": "-T4 -O -sV",
-            "security": "-T4 -O -sV --script vuln"
+            "security": "-T4 -O -sV --script vuln",
+            "30s": "-T4 --max-rtt-timeout 300ms --min-rtt-timeout 100ms --host-timeout 30s",
+            "1min": "-T4 --max-rtt-timeout 500ms --min-rtt-timeout 200ms --host-timeout 60s"
         }
+        
         args = profiles.get(profile, profiles["deep"])
         
-        print(f"[*] Starting {profile} scan on {target}...")
+        # Override with duration-based args if duration is specified
+        if duration:
+            try:
+                dur_sec = int(duration)
+                args = f"-T4 --max-rtt-timeout {max(100, dur_sec * 10)}ms --min-rtt-timeout 50ms --host-timeout {dur_sec}s"
+            except ValueError:
+                pass
+        
+        print(f"[*] Starting {profile} scan on {target} (args: {args})...")
         
         # For /24 or larger, we'll chunk the scan to provide progressive results
         if target.endswith("/24"):
