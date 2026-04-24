@@ -3,15 +3,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
 import json
+import os
 from scanner import NetworkScanner
 from capturer import PacketCapturer
 from pydantic import BaseModel
+
+# Configuration from environment
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8000"))
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+CAPTURE_INTERFACE = os.getenv("CAPTURE_INTERFACE", "wlan0")
 
 app = FastAPI(title="NetVision v2 API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -20,14 +27,13 @@ app.add_middleware(
 app.mount("/captures", StaticFiles(directory="captures"), name="captures")
 
 scanner = NetworkScanner()
-capturer = PacketCapturer(interface="wlan0") # Hardcoded from previous check
+capturer = PacketCapturer(interface=CAPTURE_INTERFACE)
 latest_results = []
 is_scanning = False
 
 class CaptureRequest(BaseModel):
     ip: str
     duration: int = 10
-active_connections: list[WebSocket] = []
 
 class ConnectionManager:
     def __init__(self):
@@ -41,11 +47,22 @@ class ConnectionManager:
         self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        # Snapshot connections to avoid mutation issues
+        connections = self.active_connections[:]
+        async def safe_send(conn):
             try:
-                await connection.send_json(message)
-            except:
-                pass
+                await conn.send_json(message)
+                return True
+            except Exception:
+                return False
+        results = await asyncio.gather(*(safe_send(conn) for conn in connections))
+        # Prune dead connections
+        for conn, ok in zip(connections, results):
+            if not ok:
+                try:
+                    self.disconnect(conn)
+                except ValueError:
+                    pass  # Already removed
 
 manager = ConnectionManager()
 
@@ -86,7 +103,8 @@ async def run_scan_task(target: str, profile: str):
             else:
                 latest_results.append(res)
         
-        await manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True})
+        # Fire-and-forget broadcast to avoid blocking scan progress
+        asyncio.create_task(manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True}))
 
     try:
         await scanner.scan_network(target, profile, progress_callback)
@@ -111,4 +129,4 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=API_HOST, port=API_PORT)

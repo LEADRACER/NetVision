@@ -9,8 +9,29 @@ class PacketCapturer:
         self.captures_dir = captures_dir
         if not os.path.exists(self.captures_dir):
             os.makedirs(self.captures_dir)
+        self.max_captures = int(os.getenv("MAX_CAPTURES", "100"))
+
+    def cleanup_old_captures(self):
+        """Remove oldest captures if count exceeds max_captures."""
+        try:
+            files = [
+                os.path.join(self.captures_dir, f)
+                for f in os.listdir(self.captures_dir)
+                if f.endswith('.pcap')
+            ]
+            if len(files) > self.max_captures:
+                files.sort(key=os.path.getmtime, reverse=True)
+                for old in files[self.max_captures:]:
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     async def capture_for_ip(self, ip, duration=10):
+        # Cleanup before capturing to keep directory size bounded
+        self.cleanup_old_captures()
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{ip.replace('.', '_')}_{timestamp}.pcap"
         filepath = os.path.join(self.captures_dir, filename)
@@ -70,9 +91,6 @@ class PacketCapturer:
                 "filename": filename,
                 "file_path": filepath
             }
-
-        except Exception as e:
-            return {"error": str(e)}
 
         except Exception as e:
             return {"error": str(e)}
