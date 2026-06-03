@@ -1,6 +1,6 @@
 import requests
 import sqlite3
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import time
 
 class GeoLocator:

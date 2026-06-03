@@ -5,7 +5,7 @@ import os
 import time
 import statistics
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 import sqlite3
 
 @dataclass

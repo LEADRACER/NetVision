@@ -3,9 +3,6 @@ uvicorn
 python-nmap
 scapy
 python-multipart
-asyncio
-sqlite3
-geolite2
 requests
 pandas
 reportlab
