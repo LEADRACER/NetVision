@@ -121,15 +121,15 @@ class ReportGenerator:
             <div class="stat-label">Total Devices</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value">{summary['total_vulnerabilities']}</div>
+            <div class="stat-value">{ctx.summary['total_vulnerabilities']}</div>
             <div class="stat-label">Vulnerabilities</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value">{len([d for d in devices if d.get('hop_count')])}</div>
+            <div class="stat-value">{len([d for d in ctx.devices if d.get('hop_count')])}</div>
             <div class="stat-label">With Hops</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value">{summary.get('ports_by_state', [{}])[0].get('open', 0)}</div>
+            <div class="stat-value">{ctx.summary.get('ports_by_state', [{}])[0].get('open', 0)}</div>
             <div class="stat-label">Open Ports</div>
         </div>
     </div>

@@ -1,6 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import asyncio
 import json
 import os
@@ -42,7 +43,6 @@ os.makedirs("reports", exist_ok=True)
 
 # Mount static file servers
 app.mount("/captures", StaticFiles(directory="captures"), name="captures")
-app.mount("/reports", StaticFiles(directory="reports"), name="reports")
 
 # Initialize services
 scanner = NetworkScanner()
@@ -124,6 +124,15 @@ async def start_scan(
     await manager.broadcast({"type": "status", "is_scanning": True})
     background_tasks.add_task(run_scan_task, target, profile, duration, trace_hops)
     return {"status": "started", "message": f"Scan started on {target if target else 'local subnet'}"}
+
+@app.get("/scan/stop")
+async def stop_scan():
+    global is_scanning
+    if not is_scanning:
+        return {"status": "not_scanning", "message": "No scan in progress"}
+    is_scanning = False
+    await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
+    return {"status": "stopped", "message": "Scan stopped"}
 
 async def run_scan_task(target: str, profile: str, duration: Optional[int], trace_hops: bool):
     global latest_results, is_scanning
@@ -300,12 +309,12 @@ async def generate_report(
             "status": "generated",
             "format": format,
             "filename": filename,
-            "download_url": f"/reports/download/{filename}"
+            "download_url": f"/reports-download/{filename}"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/reports/download/{filename}")
+@app.get("/reports-download/{filename}")
 async def download_report(filename: str):
     path = os.path.join("reports", filename)
     if not os.path.exists(path):

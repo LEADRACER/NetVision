@@ -16,7 +16,7 @@ class GeoLocator:
         self.cache_ttl = cache_ttl
         self.base_url = "http://ip-api.com/json/{}?fields=status,message,country,region,city,as,lat,lon"
 
-    async def lookup(self, ip: str, force_refresh: bool = False) -> Optional[Dict]:
+    def lookup(self, ip: str, force_refresh: bool = False) -> Optional[Dict]:
         """
         Look up geolocation for an IP.
         Returns dict with country, region, city, asn, org, lat/lon or None.
@@ -68,5 +68,5 @@ class GeoLocator:
         """Look up multiple IPs, uses cache when possible."""
         results = {}
         for ip in ips:
-            results[ip] = await self.lookup(ip)
+            results[ip] = self.lookup(ip)
         return results
