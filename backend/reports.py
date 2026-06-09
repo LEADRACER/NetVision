@@ -129,7 +129,7 @@ class ReportGenerator:
             <div class="stat-label">With Hops</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value">{ctx.summary.get('ports_by_state', [{}])[0].get('open', 0)}</div>
+            <div class="stat-value">{ctx.summary.get('ports_by_state', [{}])[0].get('open', 0) if ctx.summary.get('ports_by_state') else 0}</div>
             <div class="stat-label">Open Ports</div>
         </div>
     </div>
@@ -174,7 +174,7 @@ class ReportGenerator:
             'scan_id': ctx.scan_id,
             'generated_at': ctx.generated_at.isoformat(),
             'summary': ctx.summary,
-            'devices': [asdict(d) for d in ctx.devices]
+            'devices': ctx.devices
         }
         if not filename:
             filename = f"report_{ctx.scan_id}_{ctx.generated_at.strftime('%Y%m%d_%H%M%S')}.json"

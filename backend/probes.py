@@ -26,6 +26,7 @@ class ServiceProbe:
 class HTTPProbe(ServiceProbe):
     port = 80
     protocol = 'tcp'
+    service = 'http'
 
     async def probe(self, ip: str, port: int) -> ServiceProbeResult:
         result = ServiceProbeResult(service='http', version=None, banner=None, extra_info={}, confidence=0)
@@ -72,6 +73,7 @@ class HTTPProbe(ServiceProbe):
 class HTTPSProbe(ServiceProbe):
     port = 443
     protocol = 'tcp'
+    service = 'https'
 
     async def probe(self, ip: str, port: int) -> ServiceProbeResult:
         result = ServiceProbeResult(service='https', version=None, banner=None, extra_info={}, confidence=0)
@@ -85,10 +87,13 @@ class HTTPSProbe(ServiceProbe):
                     result.banner = server
                     result.version = HTTPProbe()._parse_version(server)
                     # SSL/TLS info
-                    ssl_info = resp.connection.transport.get_extra_info('ssl_object')
-                    if ssl_info:
-                        result.extra_info['tls_version'] = ssl_info.version()
-                        result.extra_info['cipher'] = ssl_info.cipher()
+                    try:
+                        ssl_obj = resp.connection.transport.get_ssl_object() if resp.connection and resp.connection.transport else None
+                    except Exception:
+                        ssl_obj = None
+                    if ssl_obj:
+                        result.extra_info['tls_version'] = ssl_obj.version()
+                        result.extra_info['cipher'] = ssl_obj.cipher()
                     result.extra_info['status_code'] = resp.status
                     result.extra_info['headers'] = dict(resp.headers)
                     result.confidence = 80
@@ -115,6 +120,7 @@ class HTTPSProbe(ServiceProbe):
 class SSHProbe(ServiceProbe):
     port = 22
     protocol = 'tcp'
+    service = 'ssh'
 
     async def probe(self, ip: str, port: int) -> ServiceProbeResult:
         result = ServiceProbeResult(service='ssh', version=None, banner=None, extra_info={}, confidence=0)
@@ -156,6 +162,7 @@ class SSHProbe(ServiceProbe):
 class DNSProbe(ServiceProbe):
     port = 53
     protocol = 'udp'
+    service = 'dns'
 
     async def probe(self, ip: str, port: int) -> ServiceProbeResult:
         result = ServiceProbeResult(service='dns', version=None, banner=None, extra_info={}, confidence=50)
@@ -206,6 +213,7 @@ class DNSProbe(ServiceProbe):
 class SMBProbe(ServiceProbe):
     port = 445
     protocol = 'tcp'
+    service = 'smb'
 
     async def probe(self, ip: str, port: int) -> ServiceProbeResult:
         result = ServiceProbeResult(service='smb', version=None, banner=None, extra_info={}, confidence=40)
