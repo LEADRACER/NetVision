@@ -82,18 +82,46 @@
 
 ---
 
-## PHASE 2 — API HARDENING (make it LETHAL)
+## PHASE 2 — API HARDENING ✅ (COMPLETE — 2026-06-25)
 
-### 2.1 Auth & access control
-- JWT-based auth (`PyJWT` already installed)
-- API key support for programmatic access
-- Role-based access: `viewer` (read-only), `operator` (scan/capture), `admin` (config/delete)
-- Token refresh, revocation, automatic expiry
+### 2.1 Auth & access control ✅
+- ✅ JWT-based auth via `PyJWT` — access tokens (1h) + refresh tokens (7d)
+- ✅ API key support for programmatic access (X-API-Key header)
+- ✅ Role-based access: `viewer` (read-only), `operator` (scan/capture/probe), `admin` (manage data), `superadmin` (manage tokens)
+- ✅ Role hierarchy — each level inherits lower permissions
+- ✅ Token revocation via JTI blocklist (in-memory)
+- ✅ `require_role()` dependency factory for route-level RBAC
+- ✅ Dev mode fallback: when default JWT secret + no API keys, all routes allow builtin admin
+- ✅ `POST /auth/token` — login with username/password
+- ✅ `POST /auth/refresh` — exchange refresh token for new access
+- ✅ `POST /auth/revoke` — revoke a token
+- ✅ `GET /auth/whoami` — inspect current user + role
 
-### 2.2 Rate limiting & DoS protection
-- Token-bucket per IP per endpoint group
-- Scan endpoint throttled (max 1 concurrent scan per user)
-- Request size limits, timeout enforcement on all routes
+### 2.2 Rate limiting & DoS protection ✅
+- ✅ Per-IP sliding-window rate limiter via `RateLimitMiddleware` (configurable max/window)
+- ✅ Scan start throttled: max 3 scan starts per IP per 5min window
+- ✅ `RateLimitMiddleware` adds `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` headers
+- ✅ Rate limit exceeded returns `429 Too Many Requests` with `Retry-After` header
+
+### 2.3 Input validation hardening ✅
+- ✅ `ScanTargetValidation` — validates target IP/range format, profile enum, duration constraints
+- ✅ `CaptureRequestValidation` — validates IP + duration with bounds checking
+- ✅ `ProbeTargetValidation` — validates IP + port range
+- ✅ `LoginRequest` / `TokenRefreshRequest` — pydantic models for auth endpoints
+- ✅ Path traversal prevention on report download
+
+### 2.4 CORS & security headers ✅
+- ✅ `SecurityHeadersMiddleware` sets:
+  - `X-Content-Type-Options: nosniff`
+  - `X-Frame-Options: DENY`
+  - `X-XSS-Protection: 1; mode=block`
+  - `Referrer-Policy: strict-origin-when-cross-origin`
+  - `Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()`
+  - `Cross-Origin-Resource-Policy: same-origin`
+  - `Cross-Origin-Opener-Policy: same-origin`
+  - `Cross-Origin-Embedder-Policy: require-corp`
+- ✅ CORS origins configurable via `CORS_ORIGINS` env var (default `["*"]`)
+- ✅ `.env.example` with all config vars documented
 
 ### 2.3 Input validation hardening
 - Replace bare `Optional[str]` params with full `pydantic` models using `Field(..., pattern=...)` for IPs, hosts, ports

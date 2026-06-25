@@ -1,9 +1,9 @@
-"""NetVision API — v4.3, structured & observable."""
+"""NetVision API — v5.0, hardened & authenticated."""
 
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException, Query, Request, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import asyncio
 import json
 import os
@@ -37,28 +37,32 @@ from alerts import (
     Alert, AlertType, AlertSeverity,
 )
 
+# ── Phase 2: Auth & Security imports ──────────────────────────────────────
+from auth import (
+    get_current_user, require_role, require_method, is_path_public,
+    login_for_token, refresh_access_token, revoke_token,
+    introspect_token, User, Role,
+)
+from rate_limiter import (
+    RateLimitMiddleware, check_scan_rate_limit, API_RATE_LIMITER,
+)
+from security import (
+    SecurityHeadersMiddleware,
+    ScanTargetValidation, CaptureRequestValidation,
+    ProbeTargetValidation, LoginRequest, TokenRefreshRequest,
+)
+
 # ── Initialize structured logging ────────────────────────────────────────
 from logging_setup import setup_logging
 setup_logging(settings)
-logger.info("NetVision v4.3 starting", extra={"component": "system"})
+logger.info("NetVision v5.0 starting", extra={"component": "system"})
 
 # ── FastAPI app ───────────────────────────────────────────────────────────
-app = FastAPI(title="NetVision v4.3 API")
+app = FastAPI(title="NetVision v5.0 API")
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Ensure directories
+# Ensure directories (before services that use them)
 os.makedirs(settings.captures_dir, exist_ok=True)
 os.makedirs(settings.reports_dir, exist_ok=True)
-
-# Mount static file servers
-app.mount("/captures", StaticFiles(directory=settings.captures_dir), name="captures")
 
 # ── Initialize services ──────────────────────────────────────────────────
 scanner = NetworkScanner()
@@ -71,14 +75,22 @@ health_monitor = NetworkHealthMonitor(db, interval=settings.health_check_interva
 latest_results = []
 is_scanning = False
 
-# ── Apply middleware stack (order matters) ────────────────────────────────
-app.add_middleware(MetricsMiddleware)        # 1st — capture request metrics
-app.add_middleware(RequestIDMiddleware, db=db)  # 2nd — request ID + audit trail
-
-
-class CaptureRequest(BaseModel):
-    ip: str
-    duration: int = 10
+# ── Middleware stack (order matters) ──────────────────────────────────────
+# 1. CORS (always first)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# 2. Security headers
+app.add_middleware(SecurityHeadersMiddleware)
+# 3. Rate limiting (before processing)
+app.add_middleware(RateLimitMiddleware)
+# 4. Request metrics
+app.add_middleware(MetricsMiddleware)
+# 5. Request ID + audit trail
+app.add_middleware(RequestIDMiddleware, db=db)
 
 
 class ConnectionManager:
@@ -153,6 +165,17 @@ async def startup_event():
 
     # ── Start health monitor ────────────────────────────────────────────
     await health_monitor.start()
+
+    # ── Log auth status ────────────────────────────────────────────────
+    if settings.jwt_secret_is_default:
+        logger.warning(
+            "Using default JWT secret — set JWT_SECRET in .env for production",
+            extra={"component": "system"},
+        )
+    api_key_count = len(settings.api_keys)
+    if api_key_count:
+        logger.info("API keys configured", count=api_key_count, extra={"component": "system"})
+
     logger.info("NetVision startup complete — services online",
                 extra={"component": "system", "host": settings.api_host, "port": settings.api_port})
 
@@ -174,7 +197,44 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-# ── Phase 1: Observability endpoints ──────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 2: AUTH ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/auth/token")
+async def auth_login(credentials: LoginRequest):
+    """Authenticate with username/password, receive JWT tokens."""
+    return await login_for_token(credentials.username, credentials.password)
+
+
+@app.post("/auth/refresh")
+async def auth_refresh(request: TokenRefreshRequest):
+    """Exchange a refresh token for a new access token."""
+    return await refresh_access_token(request.refresh_token)
+
+
+@app.post("/auth/revoke")
+async def auth_revoke(token: str = Body(..., embed=True)):
+    """Revoke a JWT token by adding it to the revocation set."""
+    success = revoke_token(token)
+    return {"revoked": success}
+
+
+@app.get("/auth/whoami")
+async def auth_whoami(current_user: User = Depends(get_current_user)):
+    """Return current user info from the token."""
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "role": current_user.role.value,
+        "scopes": current_user.scopes,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 1: OBSERVABILITY ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 @app.get("/metrics")
@@ -252,8 +312,9 @@ async def get_audit_log(
     method: Optional[str] = Query(None),
     path: Optional[str] = Query(None),
     min_status: Optional[int] = Query(None),
+    _: User = Depends(require_role(Role.ADMIN)),  # Only admins can read audit trail
 ):
-    """Query the audit trail."""
+    """Query the audit trail. Admin only."""
     return {
         "entries": db.get_audit_log(
             limit=limit,
@@ -265,21 +326,38 @@ async def get_audit_log(
     }
 
 
-# ── Existing endpoints (updated with metric tracking) ────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# CORE ENDPOINTS — AUTH PROTECTED
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 @app.get("/scan")
 async def start_scan(
     background_tasks: BackgroundTasks,
+    request: Request,
     target: Optional[str] = None,
     profile: str = "deep",
     duration: Optional[int] = None,
     trace_hops: bool = False,
+    current_user: User = Depends(require_role(Role.OPERATOR)),
 ):
+    """Start a network scan. Requires operator+ role."""
     global is_scanning
+
+    # Rate limit scan starts per IP
+    check_scan_rate_limit(request)
+
+    # Validate target
+    validated = ScanTargetValidation(
+        target=target,
+        profile=profile,
+        duration=duration,
+        trace_hops=trace_hops,
+    )
+
     if is_scanning:
         logger.warning("Scan requested but already in progress",
-                       extra={"component": "api", "target": target})
+                       extra={"component": "api", "target": target, "user": current_user.username})
         return {"status": "scanning", "message": "Scan already in progress"}
 
     is_scanning = True
@@ -287,23 +365,27 @@ async def start_scan(
     SCANS_TOTAL.labels(profile=profile).inc()
     await manager.broadcast({"type": "status", "is_scanning": True})
 
-    background_tasks.add_task(run_scan_task, target, profile, duration, trace_hops)
+    background_tasks.add_task(run_scan_task, validated.target, validated.profile, validated.duration, validated.trace_hops)
     logger.info("Scan started", extra={
         "component": "api", "target": target or "local_subnet",
         "profile": profile, "duration": duration, "trace_hops": trace_hops,
+        "user": current_user.username,
     })
-    return {"status": "started", "message": f"Scan started on {target if target else 'local subnet'}"}
+    return {"status": "started", "message": f"Scan started on {validated.target if validated.target else 'local subnet'}"}
 
 
 @app.get("/scan/stop")
-async def stop_scan():
+async def stop_scan(
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Stop the current scan. Requires operator+ role."""
     global is_scanning
     if not is_scanning:
         return {"status": "not_scanning", "message": "No scan in progress"}
     is_scanning = False
     SCANS_IN_PROGRESS.dec()
     await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
-    logger.info("Scan stopped by user", extra={"component": "api"})
+    logger.info("Scan stopped by user", extra={"component": "api", "user": current_user.username})
     return {"status": "stopped", "message": "Scan stopped"}
 
 
@@ -388,7 +470,9 @@ async def enrich_geolocation(ip: str):
 
 
 @app.get("/devices")
-async def get_devices():
+async def get_devices(
+    current_user: User = Depends(get_current_user),
+):
     """Return all discovered devices with health data."""
     conn = sqlite3.connect(settings.database_path_abs)
     conn.row_factory = sqlite3.Row
@@ -427,7 +511,11 @@ async def get_devices():
 
 
 @app.get("/health/history")
-async def get_health_history(device_ip: Optional[str] = None, hours: int = 24):
+async def get_health_history(
+    device_ip: Optional[str] = None,
+    hours: int = 24,
+    current_user: User = Depends(get_current_user),
+):
     """Get health metrics history."""
     conn = sqlite3.connect(settings.database_path_abs)
     conn.row_factory = sqlite3.Row
@@ -454,7 +542,10 @@ async def get_health_history(device_ip: Optional[str] = None, hours: int = 24):
 
 
 @app.get("/geolocation/{ip}")
-async def get_geolocation(ip: str):
+async def get_geolocation(
+    ip: str,
+    current_user: User = Depends(get_current_user),
+):
     """Get geolocation info for an IP."""
     cached = db.get_geolocation(ip)
     if not cached:
@@ -464,13 +555,17 @@ async def get_geolocation(ip: str):
 
 
 @app.get("/correlation")
-async def get_network_correlation():
+async def get_network_correlation(
+    current_user: User = Depends(get_current_user),
+):
     """Network correlation summary: devices by vendor, OS, port states."""
     return db.get_network_summary()
 
 
 @app.get("/topology")
-async def get_topology():
+async def get_topology(
+    current_user: User = Depends(get_current_user),
+):
     """Return graph data for topology visualization."""
     devices_source = latest_results if latest_results else db.get_all_devices()
     nodes = []
@@ -500,17 +595,26 @@ async def get_topology():
 
 
 @app.get("/reports")
-async def list_reports():
+async def list_reports(
+    current_user: User = Depends(get_current_user),
+):
+    """List generated reports."""
     return {"reports": db.list_reports()}
 
 
 @app.get("/reports/generate")
-async def generate_report(scan_id: Optional[int] = None, format: str = "html"):
+async def generate_report(
+    scan_id: Optional[int] = None,
+    format: str = "html",
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Generate a report. Requires operator+ role."""
     try:
         path = reporter.generate(scan_id, format)
         filename = os.path.basename(path)
         logger.info("Report generated", extra={
             "component": "reports", "format": format, "scan_id": scan_id, "filename": filename,
+            "user": current_user.username,
         })
         return {
             "status": "generated",
@@ -526,7 +630,14 @@ async def generate_report(scan_id: Optional[int] = None, format: str = "html"):
 
 
 @app.get("/reports-download/{filename}")
-async def download_report(filename: str):
+async def download_report(
+    filename: str,
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Download a generated report. Requires operator+ role."""
+    # Path traversal prevention
+    if ".." in filename or "/" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
     path = os.path.join(settings.reports_dir, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Report not found")
@@ -534,7 +645,10 @@ async def download_report(filename: str):
 
 
 @app.get("/vulnerabilities")
-async def get_vulnerabilities(device_ip: Optional[str] = None):
+async def get_vulnerabilities(
+    device_ip: Optional[str] = None,
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
     """List discovered vulnerabilities."""
     conn = sqlite3.connect(settings.database_path_abs)
     conn.row_factory = sqlite3.Row
@@ -555,8 +669,12 @@ async def get_vulnerabilities(device_ip: Optional[str] = None):
 
 
 @app.get("/probes/scan/{ip}")
-async def scan_services(ip: str, ports: Optional[str] = None):
-    """Run service-specific probes on an IP."""
+async def scan_services(
+    ip: str,
+    ports: Optional[str] = None,
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Run service-specific probes on an IP. Requires operator+ role."""
     if not ports:
         port_list: list[int] = [22, 80, 443, 53, 445, 3306, 8080, 21, 25, 110, 143, 3389, 5900]
     else:
@@ -581,7 +699,11 @@ async def scan_services(ip: str, ports: Optional[str] = None):
 
 
 @app.post("/capture")
-async def capture_packets(request: CaptureRequest):
+async def capture_packets(
+    request: CaptureRequestValidation,
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Capture packets for an IP. Requires operator+ role."""
     result = await capturer.capture_for_ip(request.ip, request.duration)
     if "error" in result:
         logger.error("Packet capture failed", extra={
@@ -602,8 +724,8 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    # Need JSONResponse for health/ready endpoint
     from fastapi.responses import JSONResponse
+    from fastapi import Depends
     logger.info("Starting uvicorn server", extra={
         "component": "system", "host": settings.api_host, "port": settings.api_port,
     })
