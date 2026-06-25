@@ -7,6 +7,10 @@ import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import sqlite3
+from loguru import logger
+
+log = logger.bind(component="health")
+
 
 @dataclass
 class HealthMetric:
@@ -17,6 +21,7 @@ class HealthMetric:
     status: str  # 'up', 'down', 'partial'
     jitter_ms: Optional[float] = None
     hops: Optional[int] = None
+
 
 class NetworkHealthMonitor:
     """Monitors network health by pinging known devices and tracking metrics."""
@@ -31,7 +36,7 @@ class NetworkHealthMonitor:
         """Start background health monitoring."""
         self.running = True
         self.task = asyncio.create_task(self._monitor_loop())
-        print("[*] Health monitor started")
+        log.info("Health monitor started", interval=self.interval)
 
     async def stop(self):
         """Stop health monitoring."""
@@ -59,7 +64,7 @@ class NetworkHealthMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[!] Health monitor error: {e}")
+                log.error("Health monitor error", error=str(e))
                 await asyncio.sleep(self.interval)
 
     async def _ping_device(self, device: Dict) -> HealthMetric:
@@ -97,6 +102,18 @@ class NetworkHealthMonitor:
             jitter_ms=jitter if len(pings) > 1 else None
         )
 
+    def _calculate_checksum(self, data: bytes) -> int:
+        """Calculate ICMP checksum (RFC 1071)."""
+        if len(data) % 2 != 0:
+            data += b'\x00'
+        s = 0
+        for i in range(0, len(data), 2):
+            w = (data[i] << 8) + data[i + 1]
+            s += w
+        s = (s >> 16) + (s & 0xffff)
+        s += s >> 16
+        return ~s & 0xffff
+
     async def _single_ping(self, ip: str, timeout: int = 2) -> Optional[float]:
         """Single ICMP ping using raw socket (requires root on Linux)."""
         try:
@@ -107,12 +124,18 @@ class NetworkHealthMonitor:
                 # Build ICMP echo request
                 icmp_type = 8  # Echo request
                 icmp_code = 0
-                icmp_checksum = 0
                 icmp_id = os.getpid() & 0xFFFF
                 icmp_seq = 1
                 
-                header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
-                packet = header
+                # Build header with zero checksum first
+                header = struct.pack('!BBHHH', icmp_type, icmp_code, 0, icmp_id, icmp_seq)
+                # Payload (timestamp for RTT)
+                payload = struct.pack('!d', time.time())
+                # Calculate proper checksum over header + payload
+                checksum = self._calculate_checksum(header + payload)
+                # Rebuild with correct checksum
+                header = struct.pack('!BBHHH', icmp_type, icmp_code, checksum, icmp_id, icmp_seq)
+                packet = header + payload
                 
                 start = time.time()
                 sock.sendto(packet, (ip, 1))

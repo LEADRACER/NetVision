@@ -2,6 +2,9 @@ import requests
 import sqlite3
 from typing import Optional, Dict, List
 import time
+from loguru import logger
+
+log = logger.bind(component="geo")
 
 class GeoLocator:
     """IP Geolocation using free IP API (ip-api.com)."""
@@ -58,9 +61,9 @@ class GeoLocator:
                 self.db.cache_geolocation(ip, geo)
                 return geo
             else:
-                print(f"[!] Geo lookup failed for {ip}: {data.get('message', 'Unknown error')}")
+                log.warning("Geo lookup failed", ip=ip, message=data.get("message", "Unknown error"))
         except Exception as e:
-            print(f"[!] Geo lookup error for {ip}: {e}")
+            log.error("Geo lookup error", ip=ip, error=str(e))
         
         return None
 

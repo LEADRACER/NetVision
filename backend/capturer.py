@@ -2,6 +2,9 @@ import asyncio
 import collections
 import datetime
 import os
+from loguru import logger
+
+log = logger.bind(component="capture")
 
 class PacketCapturer:
     def __init__(self, interface="wlan0", captures_dir="captures"):
@@ -93,6 +96,7 @@ class PacketCapturer:
             }
 
         except Exception as e:
+            log.error("Packet capture failed", ip=ip, duration=duration, error=str(e))
             return {"error": str(e)}
 
 if __name__ == "__main__":

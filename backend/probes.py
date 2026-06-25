@@ -5,6 +5,9 @@ import json
 from typing import Dict, Optional, List
 import asyncio
 from dataclasses import dataclass, field
+from loguru import logger
+
+log = logger.bind(component="probes")
 
 @dataclass
 class ServiceProbeResult:
@@ -46,7 +49,7 @@ class HTTPProbe(ServiceProbe):
                     }
                     result.confidence = 80
         except ImportError:
-            # Fallback to socket
+            # aiohttp not available — socket fallback
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
@@ -57,6 +60,20 @@ class HTTPProbe(ServiceProbe):
                 result.banner = banner.split('\r\n')[0] if banner else None
                 result.version = self._parse_version(result.banner)
                 result.confidence = 60
+            except Exception:
+                pass
+        except Exception as e:
+            # aiohttp installed but request failed — socket fallback
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect((ip, port))
+                sock.send(b"HEAD / HTTP/1.0\r\n\r\n")
+                banner = sock.recv(1024).decode('utf-8', errors='ignore')
+                sock.close()
+                result.banner = banner.split('\r\n')[0] if banner else None
+                result.version = self._parse_version(result.banner)
+                result.confidence = 50
             except Exception:
                 pass
         return result
@@ -98,7 +115,25 @@ class HTTPSProbe(ServiceProbe):
                     result.extra_info['headers'] = dict(resp.headers)
                     result.confidence = 80
         except ImportError:
-            # Fallback to socket+ssl
+            # aiohttp not available — socket+ssl fallback
+            try:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2)
+                    with context.wrap_socket(sock, server_hostname=ip) as ssock:
+                        ssock.connect((ip, port))
+                        cipher = ssock.cipher()
+                        version = ssock.version()
+                        result.banner = f"TLS {version} ({cipher[0] if cipher else 'unknown'})"
+                        result.version = version
+                        result.extra_info = {'tls_version': version, 'cipher': cipher}
+                        result.confidence = 70
+            except Exception:
+                pass
+        except Exception as e:
+            # aiohttp installed but request failed — socket+ssl fallback
             try:
                 context = ssl.create_default_context()
                 context.check_hostname = False
@@ -137,7 +172,7 @@ class SSHProbe(ServiceProbe):
             result.confidence = 90
             conn.close()
         except (ImportError, Exception):
-            # Socket fallback
+            # asyncssh not available or failed — socket fallback
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
@@ -242,5 +277,5 @@ async def probe_service(ip: str, port: int, protocol: str = 'tcp') -> ServicePro
     try:
         return await probe.probe(ip, port)
     except Exception as e:
-        print(f"[!] Probe failed for {ip}:{port} - {e}")
+        log.warning("Probe failed", ip=ip, port=port, probe=probe.service, error=str(e))
         return ServiceProbeResult(service=probe.service, version=None, banner=None, extra_info={'error': str(e)}, confidence=0)

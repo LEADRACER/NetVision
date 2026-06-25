@@ -1,3 +1,5 @@
+"""NetVision API — v4.3, structured & observable."""
+
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -10,6 +12,8 @@ import sqlite3
 from datetime import datetime
 from typing import Optional
 
+from loguru import logger
+
 # Import project modules
 from scanner import NetworkScanner
 from capturer import PacketCapturer
@@ -18,46 +22,52 @@ from health import NetworkHealthMonitor
 from geolocation import GeoLocator
 from reports import ReportGenerator
 from probes import probe_service, PROBES
-
+from middleware import RequestIDMiddleware
+from config import settings
 from pydantic import BaseModel
 
-# Configuration from environment
-API_HOST = os.getenv("API_HOST", "0.0.0.0")
-API_PORT = int(os.getenv("API_PORT", "8000"))
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
-CAPTURE_INTERFACE = os.getenv("CAPTURE_INTERFACE", "wlan0")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "netvision.db")
+# ── Initialize structured logging ────────────────────────────────────────
+from logging_setup import setup_logging
+setup_logging(settings)
+logger.info("NetVision v4.3 starting", extra={"component": "system"})
 
+# ── FastAPI app ───────────────────────────────────────────────────────────
 app = FastAPI(title="NetVision v4.3 API")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Request ID correlation
+app.add_middleware(RequestIDMiddleware)
+
 # Ensure directories
-os.makedirs("captures", exist_ok=True)
-os.makedirs("reports", exist_ok=True)
+os.makedirs(settings.captures_dir, exist_ok=True)
+os.makedirs(settings.reports_dir, exist_ok=True)
 
 # Mount static file servers
-app.mount("/captures", StaticFiles(directory="captures"), name="captures")
+app.mount("/captures", StaticFiles(directory=settings.captures_dir), name="captures")
 
-# Initialize services
+# ── Initialize services ──────────────────────────────────────────────────
 scanner = NetworkScanner()
-capturer = PacketCapturer(interface=CAPTURE_INTERFACE)
-db = Database(DATABASE_PATH)
-geo = GeoLocator(db)
+capturer = PacketCapturer(interface=settings.capture_interface)
+db = Database(settings.database_path_abs)
+geo = GeoLocator(db, cache_ttl=settings.geo_cache_ttl)
 reporter = ReportGenerator(db)
-health_monitor = NetworkHealthMonitor(db, interval=30)
+health_monitor = NetworkHealthMonitor(db, interval=settings.health_check_interval)
 
 latest_results = []
 is_scanning = False
 
+
 class CaptureRequest(BaseModel):
     ip: str
     duration: int = 10
+
 
 class ConnectionManager:
     def __init__(self):
@@ -72,12 +82,14 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict):
         connections = self.active_connections[:]
+
         async def safe_send(conn):
             try:
                 await conn.send_json(message)
                 return True
             except Exception:
                 return False
+
         results = await asyncio.gather(*(safe_send(conn) for conn in connections))
         for conn, ok in zip(connections, results):
             if not ok:
@@ -86,17 +98,23 @@ class ConnectionManager:
                 except ValueError:
                     pass
 
+
 manager = ConnectionManager()
+
 
 @app.on_event("startup")
 async def startup_event():
     db.init_tables()
     await health_monitor.start()
-    print("[*] NetVision started — health monitoring active")
+    logger.info("NetVision startup complete — services online",
+                extra={"component": "system", "host": settings.api_host, "port": settings.api_port})
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await health_monitor.stop()
+    logger.info("NetVision shutdown complete", extra={"component": "system"})
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -108,22 +126,31 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+
 @app.get("/scan")
 async def start_scan(
     background_tasks: BackgroundTasks,
     target: Optional[str] = None,
     profile: str = "deep",
     duration: Optional[int] = None,
-    trace_hops: bool = False
+    trace_hops: bool = False,
 ):
     global is_scanning
     if is_scanning:
+        logger.warning("Scan requested but already in progress",
+                       extra={"component": "api", "target": target})
         return {"status": "scanning", "message": "Scan already in progress"}
-    
+
     is_scanning = True
     await manager.broadcast({"type": "status", "is_scanning": True})
+
     background_tasks.add_task(run_scan_task, target, profile, duration, trace_hops)
+    logger.info("Scan started", extra={
+        "component": "api", "target": target or "local_subnet",
+        "profile": profile, "duration": duration, "trace_hops": trace_hops,
+    })
     return {"status": "started", "message": f"Scan started on {target if target else 'local subnet'}"}
+
 
 @app.get("/scan/stop")
 async def stop_scan():
@@ -132,71 +159,88 @@ async def stop_scan():
         return {"status": "not_scanning", "message": "No scan in progress"}
     is_scanning = False
     await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
+    logger.info("Scan stopped by user", extra={"component": "api"})
     return {"status": "stopped", "message": "Scan stopped"}
+
 
 async def run_scan_task(target: str, profile: str, duration: Optional[int], trace_hops: bool):
     global latest_results, is_scanning
-    
+
     scan_id = db.start_scan(target, profile, duration, trace_hops)
-    
+    logger.info("Scan task running", extra={"component": "scanner", "scan_id": scan_id, "target": target})
+
     async def progress_callback(chunk_results):
         global latest_results
-        existing_ips = {d['ip'] for d in latest_results}
+        existing_ips = {d["ip"] for d in latest_results}
         for res in chunk_results:
-            # Enrich with service probes (async, fire-and-forget)
             asyncio.create_task(enrich_device_with_probes(res))
-            
-            if res['ip'] in existing_ips:
-                idx = next((i for i, d in enumerate(latest_results) if d['ip'] == res['ip']), None)
+            if res["ip"] in existing_ips:
+                idx = next((i for i, d in enumerate(latest_results) if d["ip"] == res["ip"]), None)
                 if idx is not None:
                     latest_results[idx] = res
             else:
                 latest_results.append(res)
-        
-        asyncio.create_task(manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True}))
+
+        asyncio.create_task(
+            manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True})
+        )
 
     async def subnet_callback(subnet):
         asyncio.create_task(manager.broadcast({"type": "subnet_start", "subnet": subnet}))
 
     try:
-        await scanner.scan_network(target, profile, progress_callback, None, subnet_callback, trace_hops)
+        result = await scanner.scan_network(target, profile, progress_callback, None, subnet_callback, trace_hops)
+
         # Persist all devices to DB
         for dev in latest_results:
             db.upsert_device(scan_id, dev)
-            # Background geo lookup
-            asyncio.create_task(enrich_geolocation(dev['ip']))
-        
-        db.complete_scan(scan_id, len(latest_results), scanner.last_subnets_count if hasattr(scanner, 'last_subnets_count') else 1)
+            asyncio.create_task(enrich_geolocation(dev["ip"]))
+
+        db.complete_scan(
+            scan_id,
+            len(latest_results),
+            result.get("subnets_scanned", 1),
+        )
+        logger.info("Scan completed", extra={
+            "component": "scanner", "scan_id": scan_id,
+            "devices_found": len(latest_results),
+            **result,
+        })
+    except Exception as e:
+        logger.error("Scan task failed", extra={"component": "scanner", "scan_id": scan_id, "error": str(e)})
     finally:
         is_scanning = False
         await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
 
+
 async def enrich_device_with_probes(device: dict):
     """Run service probes on open ports to get banners/versions."""
-    for port in device.get('ports', []):
-        if port.get('state') == 'open':
+    for port in device.get("ports", []):
+        if port.get("state") == "open":
             try:
-                result = await probe_service(device['ip'], port['port'], port.get('protocol', 'tcp'))
-                port['banner'] = result.banner
-                port['service_version'] = result.version
-                port['probe_extra'] = result.extra_info
-                port['confidence'] = result.confidence
+                result = await probe_service(device["ip"], port["port"], port.get("protocol", "tcp"))
+                port["banner"] = result.banner
+                port["service_version"] = result.version
+                port["probe_extra"] = result.extra_info
+                port["confidence"] = result.confidence
             except Exception as e:
-                port['probe_error'] = str(e)
+                port["probe_error"] = str(e)
+
 
 async def enrich_geolocation(ip: str):
     """Background geolocation lookup."""
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, geo.lookup, ip, False)
+    logger.debug("Geolocation enriched", extra={"component": "geo", "ip": ip})
+
 
 @app.get("/devices")
 async def get_devices():
     """Return all discovered devices with health data."""
-    # Get latest health snapshot
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(settings.database_path_abs)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute('''
+    cursor.execute("""
         SELECT d.ip, h.latency_ms, h.status as health_status, h.packet_loss, h.timestamp as health_ts
         FROM devices d
         LEFT JOIN (
@@ -204,181 +248,202 @@ async def get_devices():
                    ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY timestamp DESC) as rn
             FROM health_metrics
         ) h ON d.id = h.device_id AND h.rn = 1
-    ''')
+    """)
     health_rows = cursor.fetchall()
     conn.close()
-    
-    health_by_ip = {r['ip']: dict(r) for r in health_rows}
-    
+
+    health_by_ip = {r["ip"]: dict(r) for r in health_rows}
+
     for dev in latest_results:
-        h = health_by_ip.get(dev['ip'])
+        h = health_by_ip.get(dev["ip"])
         if h:
-            dev['health'] = {
-                'latency_ms': h['latency_ms'],
-                'status': h['health_status'],
-                'packet_loss': h['packet_loss'],
-                'last_check': h['health_ts']
+            dev["health"] = {
+                "latency_ms": h["latency_ms"],
+                "status": h["health_status"],
+                "packet_loss": h["packet_loss"],
+                "last_check": h["health_ts"],
             }
-    
+
     return {"devices": latest_results, "is_scanning": is_scanning}
+
 
 @app.get("/health/history")
 async def get_health_history(device_ip: Optional[str] = None, hours: int = 24):
     """Get health metrics history."""
-    import sqlite3
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(settings.database_path_abs)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    
+
     if device_ip:
-        cursor.execute('''
+        cursor.execute("""
             SELECT h.* FROM health_metrics h
             JOIN devices d ON h.device_id = d.id
             WHERE d.ip = ? AND h.timestamp > datetime('now', ?)
             ORDER BY h.timestamp DESC
-        ''', (device_ip, f'-{hours} hours'))
+        """, (device_ip, f"-{hours} hours"))
     else:
-        cursor.execute('''
+        cursor.execute("""
             SELECT h.*, d.ip FROM health_metrics h
             JOIN devices d ON h.device_id = d.id
             WHERE h.timestamp > datetime('now', ?)
             ORDER BY h.timestamp DESC
-        ''', (f'-{hours} hours',))
-    
+        """, (f"-{hours} hours",))
+
     rows = cursor.fetchall()
     conn.close()
     return {"history": [dict(r) for r in rows]}
+
 
 @app.get("/geolocation/{ip}")
 async def get_geolocation(ip: str):
     """Get geolocation info for an IP."""
     cached = db.get_geolocation(ip)
     if not cached:
-        # Async lookup
         asyncio.create_task(enrich_geolocation(ip))
         return {"ip": ip, "message": "Lookup scheduled"}
     return {"ip": ip, **cached}
+
 
 @app.get("/correlation")
 async def get_network_correlation():
     """Network correlation summary: devices by vendor, OS, port states."""
     return db.get_network_summary()
 
+
 @app.get("/topology")
 async def get_topology():
     """Return graph data for topology visualization."""
-    devices = latest_results if latest_results else db.get_all_devices()
+    devices_source = latest_results if latest_results else db.get_all_devices()
     nodes = []
     edges = []
-    
-    for dev in devices:
+
+    for dev in devices_source:
         nodes.append({
-            "id": dev['ip'],
-            "label": dev['ip'],
-            "group": dev.get('hop_count', 0) or 0,
-            "vendor": dev.get('vendor', 'Unknown'),
-            "os": dev.get('os', 'Unknown'),
-            "open_ports": len([p for p in dev.get('ports', []) if p.get('state') == 'open']),
-            "vulnerable": dev.get('vulns_detected', False)
+            "id": dev["ip"],
+            "label": dev["ip"],
+            "group": dev.get("hop_count", 0) or 0,
+            "vendor": dev.get("vendor", "Unknown"),
+            "os": dev.get("os", "Unknown"),
+            "open_ports": len([p for p in dev.get("ports", []) if p.get("state") == "open"]),
+            "vulnerable": dev.get("vulns_detected", False),
         })
-        if dev.get('hop_count'):
-            parts = dev['ip'].split('.')
+        if dev.get("hop_count"):
+            parts = dev["ip"].split(".")
             router_ip = f"{parts[0]}.{parts[1]}.{parts[2]}.1"
             edges.append({
                 "from": router_ip,
-                "to": dev['ip'],
-                "length": (dev.get('distance', 1) or 1) * 50,
-                "color": "#ef4444" if dev.get('vulns_detected') else "#22c55e"
+                "to": dev["ip"],
+                "length": (dev.get("distance", 1) or 1) * 50,
+                "color": "#ef4444" if dev.get("vulns_detected") else "#22c55e",
             })
-    
+
     return {"nodes": nodes, "edges": edges}
+
 
 @app.get("/reports")
 async def list_reports():
     return {"reports": db.list_reports()}
 
+
 @app.get("/reports/generate")
-async def generate_report(
-    scan_id: Optional[int] = None,
-    format: str = "html"
-):
+async def generate_report(scan_id: Optional[int] = None, format: str = "html"):
     try:
         path = reporter.generate(scan_id, format)
         filename = os.path.basename(path)
+        logger.info("Report generated", extra={
+            "component": "reports", "format": format, "scan_id": scan_id, "filename": filename,
+        })
         return {
             "status": "generated",
             "format": format,
             "filename": filename,
-            "download_url": f"/reports-download/{filename}"
+            "download_url": f"/reports-download/{filename}",
         }
     except Exception as e:
+        logger.error("Report generation failed", extra={
+            "component": "reports", "format": format, "scan_id": scan_id, "error": str(e),
+        })
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/reports-download/{filename}")
 async def download_report(filename: str):
-    path = os.path.join("reports", filename)
+    path = os.path.join(settings.reports_dir, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Report not found")
     return FileResponse(path, filename=filename)
 
+
 @app.get("/vulnerabilities")
 async def get_vulnerabilities(device_ip: Optional[str] = None):
     """List discovered vulnerabilities."""
-    import sqlite3
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(settings.database_path_abs)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    
+
     if device_ip:
-        cursor.execute('''
+        cursor.execute("""
             SELECT v.* FROM vulnerabilities v
             JOIN devices d ON v.device_id = d.id
             WHERE d.ip = ?
-        ''', (device_ip,))
+        """, (device_ip,))
     else:
-        cursor.execute('SELECT * FROM vulnerabilities')
-    
+        cursor.execute("SELECT * FROM vulnerabilities")
+
     rows = cursor.fetchall()
     conn.close()
     return {"vulnerabilities": [dict(r) for r in rows]}
 
+
 @app.get("/probes/scan/{ip}")
-async def scan_services(ip: str, ports: str = None):
+async def scan_services(ip: str, ports: Optional[str] = None):
     """Run service-specific probes on an IP."""
     if not ports:
-        # Common ports to probe
-        ports = [22, 80, 443, 53, 445, 3306, 8080, 21, 25, 110, 143, 3389, 5900]
+        port_list: list[int] = [22, 80, 443, 53, 445, 3306, 8080, 21, 25, 110, 143, 3389, 5900]
     else:
-        ports = [int(p.strip()) for p in ports.split(',')]
-    
+        port_list = [int(p.strip()) for p in ports.split(",")]
+
     results = []
-    for port in ports:
+    for port in port_list:
         try:
-            result = await probe_service(ip, port, 'tcp')
+            result = await probe_service(ip, port, "tcp")
             results.append({
                 "port": port,
                 "service": result.service,
                 "version": result.version,
                 "banner": result.banner,
                 "confidence": result.confidence,
-                "extra": result.extra_info
+                "extra": result.extra_info,
             })
         except Exception as e:
             results.append({"port": port, "error": str(e)})
-    
+
     return {"ip": ip, "probes": results}
+
 
 @app.post("/capture")
 async def capture_packets(request: CaptureRequest):
     result = await capturer.capture_for_ip(request.ip, request.duration)
-    if 'error' in result:
-        raise HTTPException(status_code=500, detail=result['error'])
+    if "error" in result:
+        logger.error("Packet capture failed", extra={
+            "component": "capture", "ip": request.ip, "duration": request.duration, "error": result["error"],
+        })
+        raise HTTPException(status_code=500, detail=result["error"])
+    logger.info("Packet capture completed", extra={
+        "component": "capture", "ip": request.ip, "duration": request.duration,
+        "packets": result.get("total_packets"),
+    })
     return result
+
 
 @app.get("/health")
 def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=API_HOST, port=API_PORT)
+    logger.info("Starting uvicorn server", extra={
+        "component": "system", "host": settings.api_host, "port": settings.api_port,
+    })
+    uvicorn.run(app, host=settings.api_host, port=settings.api_port)

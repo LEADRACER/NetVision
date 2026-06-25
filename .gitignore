@@ -35,3 +35,11 @@ Thumbs.db
 /tmp/
 *.log
 backend/captures/*.pcap
+*.db
+backend/logs/
+backend/reports/
+reports/
+.kilo/
+.env
+captures/
+backend/captures/
