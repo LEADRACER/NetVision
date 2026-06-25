@@ -18,16 +18,48 @@
 
 ---
 
-## PHASE 1 — OBSERVABILITY (make it OBSERVABLE)
+|## PHASE 1 — OBSERVABILITY ✅ (COMPLETE — 2026-06-25)
 
-### 1.1 Structured logging (structlog)
-- Replace all `print()` calls with `structlog.get_logger()`
-- JSON output with timestamps, levels, correlation IDs, component names
-- Request middleware that injects `request_id` into every log line and response header (`X-Request-ID`)
-- Separate log files by component: `scanner.log`, `health.log`, `probes.log`, `api.log`
+### 1.1 Structured logging (loguru)
+- ✅ `print()` → `loguru` everywhere
+- ✅ JSON output with timestamps, levels, correlation IDs, component names
+- ✅ Request middleware injects `request_id` via context var on every log line and `X-Request-ID` header
+- ✅ Per-component log files: `scanner.log`, `health.log`, `probes.log`, `api.log`
 
-### 1.2 Metrics endpoint (`/metrics`)
-- Expose Prometheus-compatible `/metrics` endpoint via `prometheus_client`
+### 1.2 Metrics endpoint (`/metrics`) ✅
+- ✅ Prometheus-compatible `/metrics` via `prometheus_client`
+- ✅ 15+ custom metric families:
+  - HTTP: `netvision_http_requests_total`, `netvision_http_request_duration_ms`
+  - Scans: `netvision_scan_duration_seconds`, `netvision_scan_devices_found`, `netvision_scans_in_progress`, `netvision_scans_total`
+  - Probes: `netvision_probe_attempts_total`, `netvision_probe_success_total`, `netvision_probe_failures_total`
+  - Health: `netvision_health_devices_up`, `netvision_health_devices_down`, `netvision_health_check_duration_ms`
+  - Capture: `netvision_capture_packets_total`, `netvision_capture_bytes_total`
+  - Alerts: `netvision_alerts_sent_total`, `netvision_alert_failures_total`
+  - Database: `netvision_db_query_duration_ms`
+- ✅ MetricsMiddleware auto-records every request with cardinality-safe path cleaning
+
+### 1.3 Deep health endpoints ✅
+- ✅ `/health/live` — liveness probe (always 200)
+- ✅ `/health/ready` — readiness probe (checks db + nmap + tshark, returns 503 if degraded)
+- ✅ `/health/scan` — current scan status (is_scanning + last_scan)
+
+### 1.4 Audit trail ✅
+- ✅ `audit_log` table with SQLite: method, path, status, client_ip, request_id, user_agent, elapsed_ms
+- ✅ Indexed by timestamp
+- ✅ WAL mode enabled for concurrent reads/writes
+- ✅ RequestIDMiddleware records audit entry for every API call
+- ✅ `/audit-log` endpoint with method/path/status filter, pagination
+
+### 1.5 Alerting webhooks ✅
+- ✅ `AlertManager` singleton with rate-limited dedup (30s window)
+- ✅ `AlertWebhook` dispatchers: Slack (attachments), Discord (embeds), Telegram (markdown), generic JSON
+- ✅ Auto-alert on device down/up (from health monitor)
+- ✅ Auto-alert on scan failures
+- ✅ Configurable via `ALERT_SLACK_WEBHOOK`, `ALERT_DISCORD_WEBHOOK`, `ALERT_TELEGRAM_WEBHOOK`, `ALERT_WEBHOOK_URL` env vars
+
+### 1.6 Data retention ✅
+- ✅ Auto-prune health_metrics (90d), audit_log (30d), captures (7d) on startup
+- ✅ `prune_health_metrics()`, `prune_audit_log()`, `prune_old_captures()` methods
 - Track: request count, latency histograms per route, scan duration, health check results, probe success/failure rate, packet capture rate
 - Enable real-time Grafana dashboarding
 
