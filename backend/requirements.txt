@@ -7,3 +7,7 @@ requests
 pandas
 reportlab
 python-dotenv
+pydantic-settings
+prometheus-client
+httpx
+aiosqlite

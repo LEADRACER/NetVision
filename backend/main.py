@@ -1,6 +1,6 @@
 """NetVision API — v4.3, structured & observable."""
 
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -26,6 +26,17 @@ from middleware import RequestIDMiddleware
 from config import settings
 from pydantic import BaseModel
 
+# ── Phase 1: Observability imports ────────────────────────────────────────
+from metrics import (
+    MetricsMiddleware, metrics_endpoint,
+    SCAN_DURATION, SCAN_DEVICES_FOUND, SCANS_IN_PROGRESS, SCANS_TOTAL,
+    HEALTH_DEVICES_UP, HEALTH_DEVICES_DOWN,
+)
+from alerts import (
+    alert_manager, AlertWebhook,
+    Alert, AlertType, AlertSeverity,
+)
+
 # ── Initialize structured logging ────────────────────────────────────────
 from logging_setup import setup_logging
 setup_logging(settings)
@@ -41,9 +52,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Request ID correlation
-app.add_middleware(RequestIDMiddleware)
 
 # Ensure directories
 os.makedirs(settings.captures_dir, exist_ok=True)
@@ -62,6 +70,10 @@ health_monitor = NetworkHealthMonitor(db, interval=settings.health_check_interva
 
 latest_results = []
 is_scanning = False
+
+# ── Apply middleware stack (order matters) ────────────────────────────────
+app.add_middleware(MetricsMiddleware)        # 1st — capture request metrics
+app.add_middleware(RequestIDMiddleware, db=db)  # 2nd — request ID + audit trail
 
 
 class CaptureRequest(BaseModel):
@@ -105,6 +117,41 @@ manager = ConnectionManager()
 @app.on_event("startup")
 async def startup_event():
     db.init_tables()
+
+    # ── Configure alert webhooks from environment ───────────────────────
+    slack_url = os.getenv("ALERT_SLACK_WEBHOOK", "")
+    discord_url = os.getenv("ALERT_DISCORD_WEBHOOK", "")
+    telegram_url = os.getenv("ALERT_TELEGRAM_WEBHOOK", "")
+    generic_url = os.getenv("ALERT_WEBHOOK_URL", "")
+
+    if slack_url:
+        alert_manager.add_webhook(AlertWebhook(slack_url, "slack", "slack"))
+    if discord_url:
+        alert_manager.add_webhook(AlertWebhook(discord_url, "discord", "discord"))
+    if telegram_url:
+        alert_manager.add_webhook(AlertWebhook(telegram_url, "telegram", "telegram"))
+    if generic_url:
+        alert_manager.add_webhook(AlertWebhook(generic_url, "generic", "generic"))
+
+    webhook_count = len(alert_manager.webhooks)
+    if webhook_count:
+        logger.info("Alert webhooks configured", count=webhook_count)
+    else:
+        logger.info("No alert webhooks configured — alerts will be logged only")
+
+    # ── Data retention sweep (non-blocking) ─────────────────────────────
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, db.prune_health_metrics, 90)
+        await loop.run_in_executor(None, db.prune_audit_log, 30)
+        await loop.run_in_executor(
+            None, db.prune_old_captures, 7, settings.captures_dir
+        )
+        logger.info("Data retention sweep complete", extra={"component": "system"})
+    except Exception as e:
+        logger.warning("Data retention sweep failed", extra={"component": "system", "error": str(e)})
+
+    # ── Start health monitor ────────────────────────────────────────────
     await health_monitor.start()
     logger.info("NetVision startup complete — services online",
                 extra={"component": "system", "host": settings.api_host, "port": settings.api_port})
@@ -127,6 +174,100 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+# ── Phase 1: Observability endpoints ──────────────────────────────────────
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics scrape endpoint."""
+    return await metrics_endpoint()
+
+
+@app.get("/health/live")
+async def health_live():
+    """Liveness probe — is the process alive?"""
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness probe — are downstream dependencies available?"""
+    checks = {
+        "database": False,
+        "nmap": False,
+        "tshark": False,
+    }
+
+    # Check database
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.cursor().execute("SELECT 1")
+        conn.close()
+        checks["database"] = True
+    except Exception:
+        pass
+
+    # Check nmap
+    try:
+        import subprocess
+        result = subprocess.run(["nmap", "--version"], capture_output=True, text=True, timeout=5)
+        checks["nmap"] = result.returncode == 0
+    except Exception:
+        pass
+
+    # Check tshark
+    try:
+        import subprocess
+        result = subprocess.run(["tshark", "--version"], capture_output=True, text=True, timeout=5)
+        checks["tshark"] = result.returncode == 0
+    except Exception:
+        pass
+
+    all_ready = all(checks.values())
+    status_code = 200 if all_ready else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ready" if all_ready else "degraded",
+            "checks": checks,
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
+
+
+@app.get("/health/scan")
+async def health_scan():
+    """Current scan status."""
+    return {
+        "is_scanning": is_scanning,
+        "devices_found": len(latest_results),
+        "last_scan": db.get_latest_scan(),
+    }
+
+
+@app.get("/audit-log")
+async def get_audit_log(
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+    method: Optional[str] = Query(None),
+    path: Optional[str] = Query(None),
+    min_status: Optional[int] = Query(None),
+):
+    """Query the audit trail."""
+    return {
+        "entries": db.get_audit_log(
+            limit=limit,
+            offset=offset,
+            method=method,
+            path_like=path,
+            status_min=min_status,
+        )
+    }
+
+
+# ── Existing endpoints (updated with metric tracking) ────────────────────
+
+
 @app.get("/scan")
 async def start_scan(
     background_tasks: BackgroundTasks,
@@ -142,6 +283,8 @@ async def start_scan(
         return {"status": "scanning", "message": "Scan already in progress"}
 
     is_scanning = True
+    SCANS_IN_PROGRESS.inc()
+    SCANS_TOTAL.labels(profile=profile).inc()
     await manager.broadcast({"type": "status", "is_scanning": True})
 
     background_tasks.add_task(run_scan_task, target, profile, duration, trace_hops)
@@ -158,12 +301,13 @@ async def stop_scan():
     if not is_scanning:
         return {"status": "not_scanning", "message": "No scan in progress"}
     is_scanning = False
+    SCANS_IN_PROGRESS.dec()
     await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
     logger.info("Scan stopped by user", extra={"component": "api"})
     return {"status": "stopped", "message": "Scan stopped"}
 
 
-async def run_scan_task(target: str, profile: str, duration: Optional[int], trace_hops: bool):
+async def run_scan_task(target: Optional[str], profile: str, duration: Optional[int], trace_hops: bool):
     global latest_results, is_scanning
 
     scan_id = db.start_scan(target, profile, duration, trace_hops)
@@ -188,8 +332,14 @@ async def run_scan_task(target: str, profile: str, duration: Optional[int], trac
     async def subnet_callback(subnet):
         asyncio.create_task(manager.broadcast({"type": "subnet_start", "subnet": subnet}))
 
+    scan_start = datetime.now()
     try:
         result = await scanner.scan_network(target, profile, progress_callback, None, subnet_callback, trace_hops)
+
+        # Record scan metrics
+        scan_duration_s = (datetime.now() - scan_start).total_seconds()
+        SCAN_DURATION.labels(profile=profile).observe(scan_duration_s)
+        SCAN_DEVICES_FOUND.labels(profile=profile).observe(len(latest_results))
 
         # Persist all devices to DB
         for dev in latest_results:
@@ -204,12 +354,15 @@ async def run_scan_task(target: str, profile: str, duration: Optional[int], trac
         logger.info("Scan completed", extra={
             "component": "scanner", "scan_id": scan_id,
             "devices_found": len(latest_results),
+            "duration_s": scan_duration_s,
             **result,
         })
     except Exception as e:
         logger.error("Scan task failed", extra={"component": "scanner", "scan_id": scan_id, "error": str(e)})
+        asyncio.create_task(alert_manager.alert_scan_failed(target or "local_subnet", str(e)))
     finally:
         is_scanning = False
+        SCANS_IN_PROGRESS.dec()
         await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
 
 
@@ -263,6 +416,12 @@ async def get_devices():
                 "packet_loss": h["packet_loss"],
                 "last_check": h["health_ts"],
             }
+
+    # Update device health metrics
+    up_count = sum(1 for d in latest_results if d.get("health", {}).get("status") == "up")
+    down_count = sum(1 for d in latest_results if d.get("health", {}).get("status") == "down")
+    HEALTH_DEVICES_UP.set(up_count)
+    HEALTH_DEVICES_DOWN.set(down_count)
 
     return {"devices": latest_results, "is_scanning": is_scanning}
 
@@ -443,6 +602,8 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
+    # Need JSONResponse for health/ready endpoint
+    from fastapi.responses import JSONResponse
     logger.info("Starting uvicorn server", extra={
         "component": "system", "host": settings.api_host, "port": settings.api_port,
     })

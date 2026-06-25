@@ -2,6 +2,7 @@ import sqlite3
 import json
 import datetime
 from typing import Optional, List, Dict, Any
+from loguru import logger
 
 class Database:
     def __init__(self, db_path="netvision.db"):
@@ -125,12 +126,159 @@ class Database:
             )
         ''')
 
+        # Audit log — every API call tracked
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                method TEXT,
+                path TEXT,
+                status INTEGER,
+                client_ip TEXT,
+                request_id TEXT,
+                user_agent TEXT,
+                elapsed_ms REAL,
+                extra TEXT
+            )
+        ''')
+
+        # Indexes for fast querying
+        for table_col in [
+            ("devices", "ip"),
+            ("health_metrics", "timestamp"),
+            ("health_metrics", "device_id"),
+            ("scans", "started_at"),
+            ("audit_log", "timestamp"),
+            ("ports", "device_id"),
+        ]:
+            try:
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_col[0]}_{table_col[1]} "
+                    f"ON {table_col[0]}({table_col[1]})"
+                )
+            except Exception:
+                pass
+
+        # Enable WAL mode for better concurrent performance
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+
         conn.commit()
         conn.close()
 
+    # ─── Audit Log ────────────────────────────────────────────────────────────
+
+    def record_audit(self, method: str, path: str, status: int,
+                     client_ip: str = "", request_id: str = "",
+                     user_agent: str = "", elapsed_ms: float = 0,
+                     extra: str = ""):
+        """Record an API access to the audit trail."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO audit_log (method, path, status, client_ip, request_id,
+                                       user_agent, elapsed_ms, extra)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (method, path, status, client_ip, request_id, user_agent, elapsed_ms, extra))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").error("Audit log write failed", error=str(e))
+
+    def get_audit_log(self, limit: int = 100, offset: int = 0,
+                      method: str = None, path_like: str = None,
+                      status_min: int = None) -> List[Dict]:
+        """Query the audit log with filters."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        where_clauses = []
+        params = []
+        if method:
+            where_clauses.append("method = ?")
+            params.append(method)
+        if path_like:
+            where_clauses.append("path LIKE ?")
+            params.append(f"%{path_like}%")
+        if status_min:
+            where_clauses.append("status >= ?")
+            params.append(status_min)
+
+        where = ""
+        if where_clauses:
+            where = "WHERE " + " AND ".join(where_clauses)
+
+        cursor.execute(f"SELECT * FROM audit_log {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                       (*params, limit, offset))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ─── Data Retention ───────────────────────────────────────────────────────
+
+    def prune_health_metrics(self, retention_days: int = 90):
+        """Remove health metrics older than retention_days."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM health_metrics WHERE timestamp < datetime('now', ?)",
+            (f"-{retention_days} days",),
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if deleted:
+            logger.bind(component="database").info(
+                "Pruned health metrics", count=deleted, retention_days=retention_days
+            )
+        return deleted
+
+    def prune_audit_log(self, retention_days: int = 30):
+        """Remove audit log entries older than retention_days."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM audit_log WHERE timestamp < datetime('now', ?)",
+            (f"-{retention_days} days",),
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if deleted:
+            logger.bind(component="database").info(
+                "Pruned audit log", count=deleted, retention_days=retention_days
+            )
+        return deleted
+
+    def prune_old_captures(self, retention_days: int = 7, captures_dir: str = "captures"):
+        """Remove capture files older than retention_days."""
+        import os, time
+        deleted = 0
+        now = time.time()
+        cutoff = now - (retention_days * 86400)
+        if os.path.isdir(captures_dir):
+            for fname in os.listdir(captures_dir):
+                fpath = os.path.join(captures_dir, fname)
+                if fname.endswith(".pcap") and os.path.isfile(fpath):
+                    if os.path.getmtime(fpath) < cutoff:
+                        try:
+                            os.remove(fpath)
+                            deleted += 1
+                        except Exception:
+                            pass
+        if deleted:
+            logger.bind(component="database").info(
+                "Pruned old captures", count=deleted, retention_days=retention_days
+            )
+        return deleted
+
     # ─── Scans ────────────────────────────────────────────────────────────────
 
-    def start_scan(self, target: str, profile: str, duration: Optional[int], trace_hops: bool) -> int:
+    def start_scan(self, target: Optional[str], profile: str, duration: Optional[int], trace_hops: bool) -> int:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
