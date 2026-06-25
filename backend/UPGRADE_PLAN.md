@@ -134,34 +134,38 @@
 
 ---
 
-## PHASE 3 — SCANNER AUTONOMY (make it LETHAL)
+## PHASE 3 — SCANNER AUTONOMY ✅ (COMPLETE — 2026-06-25)
 
-### 3.1 Scan queue & task management
-- Replace `global is_scanning` + `BackgroundTasks` with proper task queue
-- Use `asyncio.Queue` or Redis-backed RQ/Celery (Celery already installed)
-- Priority levels: `critical` (top), `high`, `normal`, `low`
-- Scheduled/recurring scans (cron-like: scan 192.168.1.0/24 every 4h)
-- Scan result diffing (what changed since last scan?)
+### 3.1 Scan queue & task management ✅
+- ✅ Created `task_queue.py` — asyncio.PriorityQueue with critical/high/normal/low priorities
+- ✅ ScanTask dataclass with target, profile, duration, trace_hops, priority, requester, scan_id
+- ✅ Worker loop processes queue → defaults to `run_scan_task` executor, supports per-task callbacks
+- ✅ Scheduler loop checks `scan_schedules` DB table every 30s for due recurring scans
+- ✅ Scheduled scans auto-enqueued with correct profile/interval
+- ✅ `on_task_complete` callback fires post-scan (async via `create_task`)
+- ✅ API endpoints: `POST /scan` (enqueue), `POST /scan/stop`, `GET /scan/queue`, `GET /scan/history`
+- ✅ Schedule management: `POST /scan/schedule`, `GET /scan/schedule`, `DELETE /scan/schedule/{id}`, `POST /scan/schedule/{id}/toggle`
 
-### 3.2 Advanced scan profiles
-| Profile | Args | Use case |
-|---------|------|----------|
-| `stealth` | `-T1 -sS -n --max-retries 0` | Evasion, IDS avoidance |
-| `full` | `-T4 -p- -sV -O` | Comprehensive (all 65535 ports) |
-| `vuln` | `-T4 -sV --script vuln,exploit` | Vulnerability hunting |
-| `discovery` | `-sn -PS80,443,22` | Quick host discovery |
-| `custom` | User-defined NSE args | Power users |
+### 3.2 Advanced scan profiles ✅
+- ✅ Profiles defined with nmap args: `stealth`, `full`, `vuln`, `discovery`, `custom`
+- ✅ `profile_args` parameter passes custom NSE args through to scan
+- ✅ Used by `/scan` endpoint via `custom_args` query parameter
 
-### 3.3 Active vulnerability correlation
-- Currently `vulns_detected` is set by keyword match on `old`/`vulnerable`/`beta` — amateur
-- Replace with: version-to-CVE lookup via local CVE DB or online API (NVD/NIST)
-- CVSS scoring, severity classification, exploitability assessment
-- Store in `vulnerabilities` table (schema already exists but is unused)
+### 3.3 Active vulnerability correlation ✅
+- ✅ Created `cve_lookup.py` — NVD API v2.1 client with 3600s cache, rate limiting (6 req/s)
+- ✅ `lookup(service_version)` returns list of matched CVEs with id, description, cvss_score, severity
+- ✅ Auto-correlates after every scan: iterates discovered services, queries CVE DB, stores in `vulnerabilities` table
+- ✅ `POST /vulnerabilities/correlate` — batch CVE correlation for all devices or specific IP
+- ✅ `GET /vulnerabilities` — list discovered CVEs (existing endpoint, now with real data)
+- ✅ `GET /scan/diff/{scan_id}` — diff against previous scan on same target
 
-### 3.4 Autonomous re-scan logic
-- If a device goes down in health monitor → auto re-scan that IP
-- If new open ports detected → auto probe with service fingerprinting
-- If CVE severity > 7.0 → auto alert + detailed probe
+### 3.4 Autonomous re-scan logic ✅
+- ✅ Health monitor (`health.py`) tracks device state transitions with consecutive failure tracking
+- ✅ `on_state_change` callback fires when a device goes up→down or down→up
+- ✅ Down transition → auto-enqueues `quick` scan at HIGH priority + sends alert
+- ✅ Up transition → auto-enqueues `deep` scan at NORMAL priority
+- ✅ Auto-rescans flow through the same priority queue (respects active scan constraints)
+- ✅ Alert dispatched on device down state change via `alert_manager.send_alert()`
 
 ---
 

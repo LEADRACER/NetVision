@@ -141,6 +141,49 @@ class Database:
                 extra TEXT
             )
         ''')
+        
+        # Scan schedules — recurring scans
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS scan_schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL,
+                profile TEXT NOT NULL DEFAULT 'deep',
+                interval_minutes INTEGER NOT NULL DEFAULT 60,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                requester TEXT DEFAULT 'system',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_run TIMESTAMP
+            )
+        """)
+        
+        # Scan results — device snapshots per scan for diffing
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS scan_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL,
+                ip TEXT NOT NULL,
+                hostname TEXT,
+                mac TEXT,
+                vendor TEXT,
+                os TEXT,
+                ports_json TEXT,
+                latency_ms REAL,
+                hop_count INTEGER,
+                FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Index for scan_results lookup
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scan_results_scan_ip
+            ON scan_results(scan_id, ip)
+        """)
+        
+        # Add origin column to scans if missing
+        cursor.execute("PRAGMA table_info(scans)")
+        columns = [r[1] for r in cursor.fetchall()]
+        if "origin" not in columns:
+            cursor.execute("ALTER TABLE scans ADD COLUMN origin TEXT DEFAULT 'manual'")
 
         # Indexes for fast querying
         for table_col in [
@@ -278,13 +321,15 @@ class Database:
 
     # ─── Scans ────────────────────────────────────────────────────────────────
 
-    def start_scan(self, target: Optional[str], profile: str, duration: Optional[int], trace_hops: bool) -> int:
+    def start_scan(self, target: Optional[str], profile: str, duration: Optional[int],
+                    trace_hops: bool, requester: str = "system", origin: str = "manual",
+                    schedule_id: Optional[int] = None) -> int:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO scans (target, profile, duration, trace_hops, status)
-            VALUES (?, ?, ?, ?, 'running')
-        ''', (target, profile, duration, trace_hops))
+            INSERT INTO scans (target, profile, duration, trace_hops, status, origin)
+            VALUES (?, ?, ?, ?, 'running', ?)
+        ''', (target, profile, duration, trace_hops, origin))
         scan_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -300,6 +345,132 @@ class Database:
         ''', (total_devices, subnets_scanned, scan_id))
         conn.commit()
         conn.close()
+
+    def save_scan_results(self, scan_id: int, devices: List[Dict]):
+        """Save device snapshots for a completed scan (used for diffing)."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        for dev in devices:
+            cursor.execute('''
+                INSERT INTO scan_results (scan_id, ip, hostname, mac, vendor, os, ports_json, latency_ms, hop_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                scan_id,
+                dev.get("ip"),
+                dev.get("hostname"),
+                dev.get("mac"),
+                dev.get("vendor"),
+                dev.get("os"),
+                json.dumps(dev.get("ports", [])),
+                dev.get("latency_ms"),
+                dev.get("hop_count"),
+            ))
+        conn.commit()
+        conn.close()
+        logger.bind(component="database").info(
+            "Saved scan results", scan_id=scan_id, devices=len(devices)
+        )
+
+    def get_previous_scan(self, target: str, current_scan_id: int) -> Optional[int]:
+        """Get the most recent completed scan ID for a target before the current one."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM scans WHERE target = ? AND status = 'completed' AND id < ? ORDER BY id DESC LIMIT 1",
+            (target, current_scan_id),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def get_scan_results_by_scan(self, scan_id: int) -> List[Dict]:
+        """Get device results for a specific scan."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM scan_results WHERE scan_id = ?", (scan_id,))
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def get_scan_diff(self, scan_id: int) -> Optional[dict]:
+        """Compare scan results with the previous completed scan on same target.
+        Returns a diff dict with new/missing/changed devices."""
+        # Get the current scan's target
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT target FROM scans WHERE id = ?", (scan_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        target = row[0]
+
+        # Find previous scan on same target
+        cursor.execute(
+            "SELECT id FROM scans WHERE target = ? AND status = 'completed' AND id < ? ORDER BY id DESC LIMIT 1",
+            (target, scan_id),
+        )
+        prev = cursor.fetchone()
+        if not prev:
+            conn.close()
+            return None
+        prev_scan_id = prev[0]
+        conn.close()
+
+        # Get results for both scans
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT ip, ports_json FROM scan_results WHERE scan_id = ?", (prev_scan_id,))
+        prev_rows = [dict(r) for r in cursor.fetchall()]
+
+        cursor.execute("SELECT ip, ports_json FROM scan_results WHERE scan_id = ?", (scan_id,))
+        curr_rows = [dict(r) for r in cursor.fetchall()]
+
+        conn.close()
+
+        # Build sets
+        prev: Dict[str, set] = {}
+        curr: Dict[str, set] = {}
+        prev_ip_set = set()
+        curr_ip_set = set()
+
+        for r in prev_rows:
+            ports = json.loads(r["ports_json"]) if r.get("ports_json") else []
+            prev[r["ip"]] = set(p["port"] for p in ports if p.get("state") == "open")
+            prev_ip_set.add(r["ip"])
+
+        for r in curr_rows:
+            ports = json.loads(r["ports_json"]) if r.get("ports_json") else []
+            curr[r["ip"]] = set(p["port"] for p in ports if p.get("state") == "open")
+            curr_ip_set.add(r["ip"])
+
+        diff = {
+            "scan_id": scan_id,
+            "previous_scan_id": prev_scan_id,
+            "new_devices": [{"ip": ip} for ip in curr_ip_set - prev_ip_set],
+            "missing_devices": [{"ip": ip} for ip in prev_ip_set - curr_ip_set],
+            "changed_ports": [],
+        }
+
+        for ip in curr_ip_set & prev_ip_set:
+            old_ports = prev.get(ip, set())
+            new_ports = curr.get(ip, set())
+            added = new_ports - old_ports
+            removed = old_ports - new_ports
+            if added or removed:
+                diff["changed_ports"].append({
+                    "ip": ip,
+                    "added": list(added),
+                    "removed": list(removed),
+                })
+
+        if not any([diff["new_devices"], diff["missing_devices"], diff["changed_ports"]]):
+            return None
+
+        return diff
 
     def get_latest_scan(self) -> Optional[Dict]:
         conn = sqlite3.connect(self.db_path)
@@ -459,9 +630,27 @@ class Database:
 
     # ─── Vulnerabilities ──────────────────────────────────────────────────────
 
-    def add_vulnerability(self, device_id: int, port_id: int, vuln_data: Dict):
+    def add_vulnerability(self, device_id: Optional[int] = None, port_id: Optional[int] = None,
+                          vuln_data: Dict = None, device_ip: Optional[str] = None) -> Optional[int]:
+        """Add a vulnerability record. If device_ip provided, resolves device_id."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+
+        # Resolve device_id from IP if provided
+        if device_id is None and device_ip:
+            cursor.execute("SELECT id FROM devices WHERE ip = ?", (device_ip,))
+            row = cursor.fetchone()
+            if row:
+                device_id = row[0]
+
+        if device_id is None:
+            logger.bind(component="database").warning(
+                "Cannot add vulnerability — no device_id or IP",
+                device_ip=device_ip,
+            )
+            conn.close()
+            return None
+
         cursor.execute('''
             INSERT INTO vulnerabilities (device_id, port_id, cve_id, cvss_score, severity, description, reference_urls)
             VALUES (?, ?, ?, ?, ?, ?, ?)

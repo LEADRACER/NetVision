@@ -125,6 +125,7 @@ class NetworkScanner:
     async def scan_network(
         self, target=None, profile="deep", callback=None,
         duration=None, subnet_callback=None, trace_hops=False,
+        profile_args=None,
     ):
         if not target:
             target = self.get_local_subnet()
@@ -155,13 +156,18 @@ class NetworkScanner:
                     targets.append(subnet)
             log.info("Hop trace complete", hops_found=len(subnet_to_hop), total_subnets=len(targets))
 
-        # Profile mappings
-        profiles = {
+        # Advanced scan profiles
+        PROFILES = {
             "quick": "-T5 -F --max-retries 1",
             "deep": "-T4 -O -sV",
             "security": "-T4 -O -sV --script vuln",
+            "stealth": "-T1 -sS -n --max-retries 0",
+            "full": "-T4 -p- -sV -O",
+            "vuln": "-T4 -sV --script vuln,exploit",
+            "discovery": "-sn -PS80,443,22",
+            "custom": profile_args if profile == "custom" and profile_args else "-T4 -sV",
         }
-        base_args = profiles.get(profile, profiles["deep"])
+        base_args = PROFILES.get(profile, PROFILES["deep"])
 
         # Apply duration timeouts
         if duration:

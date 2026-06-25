@@ -52,6 +52,13 @@ from security import (
     ProbeTargetValidation, LoginRequest, TokenRefreshRequest,
 )
 
+# ── Phase 3: Scanner Autonomy imports ─────────────────────────────────────
+from task_queue import (
+    ScanTaskQueue, Priority, ScanTask, ScanSchedule, ScanDiff,
+)
+from cve_lookup import CVELookupClient
+
+
 # ── Initialize structured logging ────────────────────────────────────────
 from logging_setup import setup_logging
 setup_logging(settings)
@@ -73,7 +80,9 @@ reporter = ReportGenerator(db)
 health_monitor = NetworkHealthMonitor(db, interval=settings.health_check_interval)
 
 latest_results = []
-is_scanning = False
+# Phase 3: Task queue replaces global is_scanning
+scan_queue = ScanTaskQueue(settings.database_path_abs)
+cve_client = CVELookupClient()
 
 # ── Middleware stack (order matters) ──────────────────────────────────────
 # 1. CORS (always first)
@@ -165,7 +174,43 @@ async def startup_event():
 
     # ── Start health monitor ────────────────────────────────────────────
     await health_monitor.start()
-
+    
+    # ── Start scan queue ────────────────────────────────────────────────
+    # Wire the scan execution function and completion callback to the queue
+    scan_queue.register_executor(run_scan_task)
+    scan_queue.on_task_complete(_on_scan_complete)
+    await scan_queue.start()
+    
+    # Wire health monitor state changes → auto-rescan
+    async def health_state_changed(ip: str, old_state: str, new_state: str, device_info: dict):
+        """Auto-enqueue a scan when a device transitions state."""
+        if old_state == "up" and new_state == "down":
+            logger.info("Auto-rescan triggered by device down", ip=ip)
+            await alert_manager.send_alert(
+                Alert(
+                    title="Device went offline — rescan triggered",
+                    message=f"{device_info.get('vendor', 'Unknown')} at {ip} is down",
+                    severity=AlertSeverity.WARNING,
+                    alert_type=AlertType.DEVICE_DOWN,
+                )
+            )
+            scan_queue.enqueue(
+                target=ip,
+                profile="quick",
+                priority=Priority.HIGH,
+                requester="health_monitor",
+            )
+        elif old_state == "down" and new_state == "up":
+            logger.info("Auto-rescan triggered by device recovery", ip=ip)
+            scan_queue.enqueue(
+                target=ip,
+                profile="deep",
+                priority=Priority.NORMAL,
+                requester="health_monitor",
+            )
+    
+    health_monitor.on_state_change(health_state_changed)
+    
     # ── Log auth status ────────────────────────────────────────────────
     if settings.jwt_secret_is_default:
         logger.warning(
@@ -183,6 +228,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     await health_monitor.stop()
+    await scan_queue.stop()
+    await cve_client.close()
     logger.info("NetVision shutdown complete", extra={"component": "system"})
 
 
@@ -190,7 +237,7 @@ async def shutdown_event():
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
-        await websocket.send_json({"type": "update", "devices": latest_results, "is_scanning": is_scanning})
+        await websocket.send_json({"type": "update", "devices": latest_results, "is_scanning": scan_queue.is_active})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -299,7 +346,13 @@ async def health_ready():
 async def health_scan():
     """Current scan status."""
     return {
-        "is_scanning": is_scanning,
+        "is_scanning": scan_queue.is_active,
+        "active_task": {
+            "target": scan_queue.active_task.target,
+            "profile": scan_queue.active_task.profile,
+            "priority": scan_queue.active_task.priority.name,
+        } if scan_queue.active_task else None,
+        "queue_depth": scan_queue.pending_count,
         "devices_found": len(latest_results),
         "last_scan": db.get_latest_scan(),
     }
@@ -331,19 +384,18 @@ async def get_audit_log(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@app.get("/scan")
+@app.post("/scan")
 async def start_scan(
-    background_tasks: BackgroundTasks,
     request: Request,
-    target: Optional[str] = None,
-    profile: str = "deep",
-    duration: Optional[int] = None,
-    trace_hops: bool = False,
+    target: Optional[str] = Query(None),
+    profile: str = Query("deep"),
+    duration: Optional[int] = Query(None),
+    trace_hops: bool = Query(False),
+    priority: str = Query("normal"),
+    custom_args: Optional[str] = Query(None),
     current_user: User = Depends(require_role(Role.OPERATOR)),
 ):
-    """Start a network scan. Requires operator+ role."""
-    global is_scanning
-
+    """Start a network scan. Enqueues with priority. Requires operator+ role."""
     # Rate limit scan starts per IP
     check_scan_rate_limit(request)
 
@@ -355,45 +407,70 @@ async def start_scan(
         trace_hops=trace_hops,
     )
 
-    if is_scanning:
-        logger.warning("Scan requested but already in progress",
-                       extra={"component": "api", "target": target, "user": current_user.username})
-        return {"status": "scanning", "message": "Scan already in progress"}
+    # Map priority string to enum
+    prio_map = {
+        "critical": Priority.CRITICAL,
+        "high": Priority.HIGH,
+        "normal": Priority.NORMAL,
+        "low": Priority.LOW,
+    }
+    prio = prio_map.get(priority.lower(), Priority.NORMAL)
 
-    is_scanning = True
-    SCANS_IN_PROGRESS.inc()
+    # Enqueue the scan
+    scan_id = db.start_scan(
+        validated.target, validated.profile, validated.duration,
+        validated.trace_hops, requester=current_user.username, origin="manual",
+    )
+    scan_queue.enqueue(
+        target=validated.target,
+        profile=validated.profile,
+        duration=validated.duration,
+        trace_hops=validated.trace_hops,
+        priority=prio,
+        requester=current_user.username,
+        scan_id=scan_id,
+        profile_args=custom_args,
+    )
+
     SCANS_TOTAL.labels(profile=profile).inc()
     await manager.broadcast({"type": "status", "is_scanning": True})
 
-    background_tasks.add_task(run_scan_task, validated.target, validated.profile, validated.duration, validated.trace_hops)
-    logger.info("Scan started", extra={
+    logger.info("Scan enqueued", extra={
         "component": "api", "target": target or "local_subnet",
-        "profile": profile, "duration": duration, "trace_hops": trace_hops,
-        "user": current_user.username,
+        "profile": profile, "priority": priority, "duration": duration,
+        "user": current_user.username, "scan_id": scan_id,
     })
-    return {"status": "started", "message": f"Scan started on {validated.target if validated.target else 'local subnet'}"}
+    return {
+        "status": "enqueued",
+        "scan_id": scan_id,
+        "queue_depth": scan_queue.pending_count,
+        "message": f"Scan enqueued on {validated.target if validated.target else 'local subnet'}",
+    }
 
 
-@app.get("/scan/stop")
+@app.post("/scan/stop")
 async def stop_scan(
     current_user: User = Depends(require_role(Role.OPERATOR)),
 ):
-    """Stop the current scan. Requires operator+ role."""
-    global is_scanning
-    if not is_scanning:
+    """Stop the current scan if active."""
+    if not scan_queue.is_active:
         return {"status": "not_scanning", "message": "No scan in progress"}
-    is_scanning = False
+    # Cancel the active task
+    if hasattr(scan_queue, "_active_future") and scan_queue._active_future and not scan_queue._active_future.done():
+        scan_queue._active_future.cancel()
     SCANS_IN_PROGRESS.dec()
     await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
     logger.info("Scan stopped by user", extra={"component": "api", "user": current_user.username})
-    return {"status": "stopped", "message": "Scan stopped"}
+    return {"status": "stopped", "message": "Active scan cancelled"}
 
 
-async def run_scan_task(target: Optional[str], profile: str, duration: Optional[int], trace_hops: bool):
-    global latest_results, is_scanning
+async def run_scan_task(task: ScanTask):
+    global latest_results
 
-    scan_id = db.start_scan(target, profile, duration, trace_hops)
-    logger.info("Scan task running", extra={"component": "scanner", "scan_id": scan_id, "target": target})
+    scan_id = task.scan_id
+    target = task.target or task.target
+    profile = task.profile or "deep"
+    logger.info("Scan task running", extra={"component": "scanner", "scan_id": scan_id, "target": task.target, "profile": task.profile})
 
     async def progress_callback(chunk_results):
         global latest_results
@@ -406,7 +483,6 @@ async def run_scan_task(target: Optional[str], profile: str, duration: Optional[
                     latest_results[idx] = res
             else:
                 latest_results.append(res)
-
         asyncio.create_task(
             manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True})
         )
@@ -416,7 +492,15 @@ async def run_scan_task(target: Optional[str], profile: str, duration: Optional[
 
     scan_start = datetime.now()
     try:
-        result = await scanner.scan_network(target, profile, progress_callback, None, subnet_callback, trace_hops)
+        result = await scanner.scan_network(
+            task.target or None,
+            task.profile,
+            progress_callback,
+            None,
+            subnet_callback,
+            task.trace_hops,
+            profile_args=task.profile_args,
+        )
 
         # Record scan metrics
         scan_duration_s = (datetime.now() - scan_start).total_seconds()
@@ -433,19 +517,68 @@ async def run_scan_task(target: Optional[str], profile: str, duration: Optional[
             len(latest_results),
             result.get("subnets_scanned", 1),
         )
+
+        # Save scan results for diffing
+        db.save_scan_results(scan_id, latest_results)
+
+        # Run CVE correlation on discovered services
+        cve_count = 0
+        for dev in latest_results:
+            for port in dev.get("ports", []):
+                service_version = port.get("service_version") or port.get("banner", "")
+                if service_version:
+                    cves = await cve_client.lookup(service_version)
+                    for cve in cves:
+                        db.add_vulnerability(
+                            device_ip=dev["ip"],
+                            port_id=port.get("port", 0),
+                            vuln_data=cve,
+                        )
+                        cve_count += 1
+
         logger.info("Scan completed", extra={
             "component": "scanner", "scan_id": scan_id,
             "devices_found": len(latest_results),
             "duration_s": scan_duration_s,
+            "cves_found": cve_count,
             **result,
         })
+
+        # Compute diff against previous scan
+        diff = db.get_scan_diff(scan_id)
+        if diff and (diff.new_devices or diff.missing_devices or diff.changed_ports):
+            logger.info("Scan diff detected changes",
+                extra={"component": "diff", "scan_id": scan_id,
+                       "new": len(diff.new_devices), "missing": len(diff.missing_devices),
+                       "changed_ports": len(diff.changed_ports)})
+
+        return diff
     except Exception as e:
         logger.error("Scan task failed", extra={"component": "scanner", "scan_id": scan_id, "error": str(e)})
-        asyncio.create_task(alert_manager.alert_scan_failed(target or "local_subnet", str(e)))
+        asyncio.create_task(alert_manager.alert_scan_failed(task.target or "local_subnet", str(e)))
+        return None
     finally:
-        is_scanning = False
         SCANS_IN_PROGRESS.dec()
         await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
+
+
+async def _on_scan_complete(task: ScanTask, diff: Optional[ScanDiff]):
+    """Callback fired by ScanTaskQueue when a scan finishes."""
+    if diff and (diff.new_vulnerabilities or diff.missing_devices):
+        logger.info("Scan completed with changes",
+            extra={"component": "queue", "task": task.target,
+                   "new_vulns": len(diff.new_vulnerabilities)})
+        # Alert on new vulnerabilities
+        for vuln in diff.new_vulnerabilities:
+            asyncio.create_task(alert_manager.send_alert(
+                Alert(
+                    title=f"New vulnerability: {vuln.get('cve_id', 'Unknown')}",
+                    message=vuln.get("description", ""),
+                    severity=AlertSeverity.HIGH,
+                    alert_type=AlertType.VULN_FOUND,
+                    fields={"ip": task.target, "cvss": str(vuln.get("cvss_score", "N/A"))},
+                )
+            ))
 
 
 async def enrich_device_with_probes(device: dict):
@@ -722,7 +855,157 @@ def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3: SCANNER AUTONOMY ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/scan/queue")
+async def get_scan_queue(
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get scan queue status and pending tasks."""
+    active = scan_queue.active_task
+    return {
+        "is_active": scan_queue.is_active,
+        "pending_count": scan_queue.pending_count,
+        "active_task": {
+            "target": active.target,
+            "profile": active.profile,
+            "priority": active.priority.name,
+            "requester": active.requester,
+            "created_at": datetime.fromtimestamp(active.created_at).isoformat(),
+            "scan_id": active.scan_id,
+        } if active else None,
+        "pending_tasks": scan_queue.pending_tasks(),
+    }
+
+
+@app.get("/scan/history")
+async def get_scan_history(
+    limit: int = Query(20, le=100),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get completed scan task history."""
+    return {
+        "history": scan_queue.history(limit=limit),
+    }
+
+
+@app.post("/scan/schedule")
+async def create_scan_schedule(
+    target: str = Body(..., embed=True),
+    profile: str = Body("deep", embed=True),
+    interval_minutes: int = Body(60, ge=5, le=43200),
+    requester: str = Body("manual", embed=True),
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Create a recurring scan schedule. Requires operator+ role."""
+    return scan_queue.add_schedule(target, profile, interval_minutes, requester)
+
+
+@app.get("/scan/schedule")
+async def list_scan_schedules(
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """List all recurring scan schedules."""
+    return {"schedules": scan_queue.list_schedules()}
+
+
+@app.delete("/scan/schedule/{schedule_id}")
+async def delete_scan_schedule(
+    schedule_id: int,
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Delete a recurring scan schedule. Requires operator+ role."""
+    return scan_queue.delete_schedule(schedule_id)
+
+
+@app.post("/scan/schedule/{schedule_id}/toggle")
+async def toggle_scan_schedule(
+    schedule_id: int,
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Enable or disable a scan schedule. Requires operator+ role."""
+    return scan_queue.toggle_schedule(schedule_id)
+
+
+@app.get("/scan/diff/{scan_id}")
+async def get_scan_diff(
+    scan_id: int,
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get differences between scan and previous scan on same target."""
+    diff = db.get_scan_diff(scan_id)
+    if diff is None:
+        return {"diff": None, "message": "No previous scan for comparison"}
+    return {
+        "diff": {
+            "new_devices": diff.new_devices,
+            "missing_devices": diff.missing_devices,
+            "changed_ports": diff.changed_ports,
+            "new_vulnerabilities": diff.new_vulnerabilities,
+            "resolved_vulnerabilities": diff.resolved_vulnerabilities,
+        }
+    }
+
+
+@app.post("/vulnerabilities/correlate")
+async def correlate_vulnerabilities(
+    target_ip: Optional[str] = Body(None, embed=True),
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Trigger CVE correlation for discovered services. Requires operator+ role."""
+    conn = sqlite3.connect(settings.database_path_abs)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if target_ip:
+        # Get devices with open ports and service versions for a specific IP
+        cursor.execute("""
+            SELECT d.id as device_id, d.ip, dp.port, dp.service, dp.version, dp.banner
+            FROM devices d
+            JOIN device_ports dp ON d.id = dp.device_id
+            WHERE d.ip = ?
+        """, (target_ip,))
+    else:
+        # Get all devices with open ports and service versions
+        cursor.execute("""
+            SELECT d.id as device_id, d.ip, dp.port, dp.service, dp.version, dp.banner
+            FROM devices d
+            JOIN device_ports dp ON d.id = dp.device_id
+        """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_cves = 0
+    for row in rows:
+        service_version = row.get("version") or row.get("banner", "")
+        if not service_version:
+            continue
+        cves = await cve_client.lookup(service_version)
+        for cve in cves:
+            db.add_vulnerability(
+                device_id=row["device_id"],
+                port_id=row["port"],
+                vuln_data=cve,
+            )
+            total_cves += 1
+
+    logger.info("Vulnerability correlation complete",
+        extra={"component": "api", "target_ip": target_ip or "all", "cves_found": total_cves})
+
+    return {
+        "status": "correlated",
+        "services_checked": len(rows),
+        "cves_found": total_cves,
+    }
+
+
 if __name__ == "__main__":
+
     import uvicorn
     from fastapi.responses import JSONResponse
     from fastapi import Depends

@@ -31,6 +31,14 @@ class NetworkHealthMonitor:
         self.interval = interval  # seconds between checks
         self.running = False
         self.task = None
+        self._device_states: Dict[str, str] = {}  # ip → last known state
+        self._consecutive_failures: Dict[str, int] = {}  # ip → consecutive failures
+        self._on_state_change = None  # callback(ip, old_state, new_state)
+
+    def on_state_change(self, callback):
+        """Register callback for device state transitions.
+        Called with (ip: str, old_state: str, new_state: str, device_info: dict)."""
+        self._on_state_change = callback
 
     async def start(self):
         """Start background health monitoring."""
@@ -59,6 +67,23 @@ class NetworkHealthMonitor:
                 for dev, result in zip(devices, results):
                     if isinstance(result, HealthMetric):
                         self.db.record_health(dev['id'], result.latency_ms, result.status, result.packet_loss)
+                        
+                        # Track state transitions for auto-rescan
+                        ip = dev['ip']
+                        new_state = result.status
+                        old_state = self._device_states.get(ip)
+                        
+                        if new_state == 'down':
+                            self._consecutive_failures[ip] = self._consecutive_failures.get(ip, 0) + 1
+                        else:
+                            self._consecutive_failures[ip] = 0
+                        
+                        if old_state and old_state != new_state:
+                            log.info("Device state changed", ip=ip, old=old_state, new=new_state)
+                            if self._on_state_change:
+                                asyncio.create_task(self._on_state_change(ip, old_state, new_state, dev))
+                        
+                        self._device_states[ip] = new_state
                 
                 await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
