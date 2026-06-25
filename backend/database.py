@@ -185,6 +185,156 @@ class Database:
         if "origin" not in columns:
             cursor.execute("ALTER TABLE scans ADD COLUMN origin TEXT DEFAULT 'manual'")
 
+        # ════════════════════════════════════════════════════════════════
+        # PHASE 4: PACKET CAPTURE & ANALYSIS TABLES
+        # ════════════════════════════════════════════════════════════════
+
+        # Per-second traffic snapshots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS traffic_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                mac TEXT DEFAULT '',
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                bytes_sent INTEGER DEFAULT 0,
+                bytes_recv INTEGER DEFAULT 0,
+                packets_sent INTEGER DEFAULT 0,
+                packets_recv INTEGER DEFAULT 0,
+                protocols TEXT DEFAULT '{}',
+                syn_rate REAL DEFAULT 0.0,
+                port_scan_score REAL DEFAULT 0.0,
+                alert_flags TEXT DEFAULT '[]'
+            )
+        """)
+
+        # HTTP request/response logs
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS http_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT NOT NULL,
+                method TEXT DEFAULT '',
+                uri TEXT DEFAULT '',
+                host TEXT DEFAULT '',
+                status_code INTEGER DEFAULT 0,
+                log_type TEXT DEFAULT 'request'
+            )
+        """)
+
+        # DNS query logs
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dns_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT DEFAULT '',
+                query_name TEXT NOT NULL,
+                query_type TEXT DEFAULT 'A',
+                is_response INTEGER DEFAULT 0
+            )
+        """)
+
+        # TLS handshake logs
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tls_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT DEFAULT '',
+                cipher_suite TEXT DEFAULT '',
+                sni TEXT DEFAULT '',
+                version TEXT DEFAULT ''
+            )
+        """)
+
+        # DHCP message logs
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dhcp_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                src_mac TEXT DEFAULT '',
+                hostname TEXT DEFAULT '',
+                vendor_class TEXT DEFAULT ''
+            )
+        """)
+
+        # Suspicious DNS (potential tunneling)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS suspicious_dns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                dns_server TEXT DEFAULT '',
+                sample_names TEXT DEFAULT '[]',
+                avg_entropy REAL DEFAULT 0.0,
+                total_queries INTEGER DEFAULT 0
+            )
+        """)
+
+        # Traffic baselines (per MAC)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS traffic_baselines (
+                mac TEXT PRIMARY KEY,
+                ip TEXT DEFAULT '',
+                first_seen REAL DEFAULT 0.0,
+                last_seen REAL DEFAULT 0.0,
+                mean_bytes_per_sec REAL DEFAULT 0.0,
+                std_bytes_per_sec REAL DEFAULT 0.0,
+                mean_packets_per_sec REAL DEFAULT 0.0,
+                std_packets_per_sec REAL DEFAULT 0.0,
+                protocol_profile TEXT DEFAULT '{}',
+                active_hours TEXT DEFAULT '[0]*24',
+                peer_ips TEXT DEFAULT '[]',
+                sample_count INTEGER DEFAULT 0,
+                last_anomaly_score REAL DEFAULT 0.0
+            )
+        """)
+
+        # Anomaly events
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS anomaly_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                mac TEXT DEFAULT '',
+                ip TEXT DEFAULT '',
+                score REAL DEFAULT 0.0,
+                reason TEXT DEFAULT '',
+                detail TEXT DEFAULT '{}'
+            )
+        """)
+
+        # Rogue AP / deauth detection
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rogue_ap_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                event_type TEXT NOT NULL,
+                bssid TEXT DEFAULT '',
+                ssid TEXT DEFAULT '',
+                src_mac TEXT DEFAULT '',
+                channel INTEGER DEFAULT 0,
+                rssi INTEGER DEFAULT 0,
+                detail TEXT DEFAULT ''
+            )
+        """)
+
+        # Indexes for Phase 4 tables
+        for table_col in [
+            ("traffic_snapshots", "ip"),
+            ("traffic_snapshots", "timestamp"),
+            ("http_logs", "src_ip"),
+            ("dns_logs", "src_ip"),
+            ("dns_logs", "query_name"),
+            ("tls_logs", "src_ip"),
+            ("suspicious_dns", "ip"),
+            ("anomaly_events", "mac"),
+            ("anomaly_events", "timestamp"),
+            ("rogue_ap_events", "event_type"),
+        ]:
+            idx_name = f"idx_{table_col[0]}_{table_col[1]}"
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table_col[0]}({table_col[1]})")
+
         # Indexes for fast querying
         for table_col in [
             ("devices", "ip"),
@@ -743,3 +893,221 @@ class Database:
             'ports_by_state': ports_by_state,
             'total_vulnerabilities': total_vulns
         }
+
+
+    # ═════════════════════════════════════════════════════════════════════
+    # PHASE 4: PACKET CAPTURE & PROTOCOL DECODING METHODS
+    # ═════════════════════════════════════════════════════════════════════
+
+    def record_traffic_snapshot(self, snapshot):
+        """Record a per-second traffic snapshot for an IP."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO traffic_snapshots
+                    (ip, mac, bytes_sent, bytes_recv, packets_sent, packets_recv,
+                     protocols, syn_rate, port_scan_score, alert_flags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                snapshot.ip, snapshot.mac,
+                snapshot.bytes_sent, snapshot.bytes_recv,
+                snapshot.packets_sent, snapshot.packets_recv,
+                json.dumps(snapshot.protocols),
+                snapshot.syn_rate, snapshot.port_scan_score,
+                json.dumps(snapshot.alert_flags),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug(
+                "Traffic snapshot error", error=str(e))
+
+    def record_http_log(self, data):
+        """Record an HTTP request or response."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            if hasattr(data, 'method'):
+                cursor.execute("""
+                    INSERT INTO http_logs (timestamp, src_ip, dst_ip, method, uri, host, log_type)
+                    VALUES (?, ?, ?, ?, ?, ?, 'request')
+                """, (data.timestamp, data.src_ip, data.dst_ip, data.method, data.uri, data.host))
+            else:
+                cursor.execute("""
+                    INSERT INTO http_logs (timestamp, src_ip, dst_ip, status_code, log_type)
+                    VALUES (?, ?, ?, ?, 'response')
+                """, (data.timestamp, data.src_ip, data.dst_ip, data.status_code))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("HTTP log error", error=str(e))
+
+    def record_dns_log(self, query):
+        """Record a DNS query."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO dns_logs (timestamp, src_ip, dst_ip, query_name, query_type, is_response)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (query.timestamp, query.src_ip, query.dst_ip,
+                  query.query_name, query.query_type, 1 if query.is_response else 0))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("DNS log error", error=str(e))
+
+    def record_tls_log(self, hs):
+        """Record a TLS handshake."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO tls_logs (timestamp, src_ip, dst_ip, cipher_suite, sni, version)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (hs.timestamp, hs.src_ip, hs.dst_ip, hs.cipher_suite, hs.sni, hs.version))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("TLS log error", error=str(e))
+
+    def record_dhcp_log(self, msg):
+        """Record a DHCP message."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO dhcp_logs (timestamp, src_mac, hostname, vendor_class)
+                VALUES (?, ?, ?, ?)
+            """, (msg.timestamp, msg.src_mac, msg.hostname, msg.vendor_class))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("DHCP log error", error=str(e))
+
+    def store_suspicious_dns(self, data: dict):
+        """Store a suspicious DNS tunneling alert."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO suspicious_dns (ip, timestamp, dns_server, sample_names, avg_entropy, total_queries)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                data.get("ip", ""),
+                data.get("timestamp", 0.0),
+                data.get("dns_server", ""),
+                json.dumps(data.get("sample_names", [])),
+                data.get("avg_entropy", 0.0),
+                data.get("total_queries", 0),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("Suspicious DNS error", error=str(e))
+
+    def save_baseline(self, baseline):
+        """Persist a device traffic baseline."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO traffic_baselines
+                    (mac, ip, first_seen, last_seen, mean_bytes_per_sec, std_bytes_per_sec,
+                     mean_packets_per_sec, std_packets_per_sec, protocol_profile,
+                     active_hours, peer_ips, sample_count, last_anomaly_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                baseline.mac, baseline.ip, baseline.first_seen, baseline.last_seen,
+                baseline.mean_bytes_per_sec, baseline.std_bytes_per_sec,
+                baseline.mean_packets_per_sec, baseline.std_packets_per_sec,
+                json.dumps(baseline.protocol_profile),
+                json.dumps(baseline.active_hours),
+                json.dumps(list(baseline.peer_ips)),
+                baseline.sample_count, baseline.last_anomaly_score,
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("Save baseline error", error=str(e))
+
+    def record_anomaly(self, event):
+        """Record a traffic anomaly event."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO anomaly_events (timestamp, mac, ip, score, reason, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                event.timestamp, event.mac, event.ip, event.score,
+                event.reason, json.dumps(event.detail),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("Anomaly log error", error=str(e))
+
+    def record_rogue_ap(self, event_type="", bssid="", ssid="",
+                         src_mac="", channel=0, rssi=0, detail=""):
+        """Record a rogue AP or deauth detection event."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO rogue_ap_events (event_type, bssid, ssid, src_mac, channel, rssi, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (event_type, bssid, ssid, src_mac, channel, rssi, detail))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.bind(component="database").debug("Rogue AP error", error=str(e))
+
+    def get_packet_analysis_summary(self) -> dict:
+        """Get summary statistics from packet capture tables."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT COUNT(*) as c FROM traffic_snapshots")
+            snapshots = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) as c FROM http_logs")
+            http_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) as c FROM dns_logs")
+            dns_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) as c FROM tls_logs")
+            tls_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) as c FROM suspicious_dns")
+            dns_suspicious = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) as c FROM anomaly_events")
+            anomalies = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT ip, SUM(packets_sent + packets_recv) as total_packets,
+                       SUM(bytes_sent + bytes_recv) as total_bytes
+                FROM traffic_snapshots
+                GROUP BY ip ORDER BY total_packets DESC LIMIT 10
+            """)
+            top_talkers = [dict(r) for r in cursor.fetchall()]
+
+            conn.close()
+            return {
+                "total_snapshots": snapshots,
+                "http_requests": http_count,
+                "dns_queries": dns_count,
+                "tls_handshakes": tls_count,
+                "dns_suspicious": dns_suspicious,
+                "anomalies": anomalies,
+                "top_talkers": top_talkers,
+            }
+        except Exception as e:
+            logger.bind(component="database").debug(
+                "Packet analysis summary error", error=str(e))
+            return {}

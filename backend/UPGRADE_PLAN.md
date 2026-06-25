@@ -169,31 +169,54 @@
 
 ---
 
-## PHASE 4 — PACKET CAPTURE & ANALYSIS (make it LETHAL)
+## PHASE 4 — PACKET CAPTURE & ANALYSIS ✅
 
-### 4.1 Enhanced packet capture
-- Current: `tshark -a duration:N -H` → dumps raw pcap
-- Upgrade: streaming capture with real-time protocol parsing
-- Track per-IP: total packets, bytes, protocols, top talkers
-- Detect: ARP spoofing, SYN flood, port scan attempts, DNS tunneling
+### ✅ 4.1 Enhanced packet capture
+- `packet_analyzer.py` (447 lines) — streaming tshark via `-T jsonraw` with async subprocess
+- Per-IP tracking: packets sent/recv, bytes sent/recv, protocol histogram, SYN rate, port scan score
+- Real-time detection: SYN flood (`SYN rate > 100/s`), ARP spoof (`IP-MAC binding change`), port scan (`>25 dest ports in window`)
+- DNS tunneling detection (entropy-based, >3.5 bits/char threshold)
+- 5-second snapshot aggregation with callback pipeline
 
-### 4.2 Protocol decoding
-- HTTP request/response capture
-- DNS query logging
-- TLS handshake metadata (cipher suites, versions, cert info)
-- DHCP fingerprinting
+### ✅ 4.2 Protocol decoding
+- `protocol_decoder.py` (294 lines) — HTTP request/response, DNS queries, TLS handshakes, DHCP
+- Extracts method/URI/host/user-agent (HTTP), query name/type (DNS), cipher/SNI/version (TLS), hostname/vendor (DHCP)
+- DB-backed: `http_logs`, `dns_logs`, `tls_logs`, `dhcp_logs` tables
+- Decoder pipeline integrated into streaming capture as an event system
 
-### 4.3 Network behavioral analysis
-- Baseline normal traffic patterns per device
-- Flag anomalies: unexpected protocols, unusual traffic volumes, new device connections
-- Store behavioral baselines in DB per MAC address
+### ✅ 4.3 Network behavioral analysis
+- `traffic_baseline.py` (215 lines) — per-MAC rolling statistics
+- Tracks: mean/std for bytes/sec and packets/sec, protocol distribution profile, active hours, peer IPs
+- Z-score anomaly computation: `|z| > 3` flags volume/peer/protocol anomalies
+- Records to `traffic_baselines` and `anomaly_events` tables
+- Thread-safe update + persistence via database callbacks
 
-### 4.4 Deauth / rogue AP detection
-- Monitor for deauthentication packets (Wi-Fi)
-- Detect beacon frames from unknown SSIDs
-- Alert on MAC spoofing (MAC → vendor mismatch)
+### ✅ 4.4 Rogue AP / deauth detection
+- `capturer.py` — `scan_for_rogue_aps()` method uses tshark to capture beacon & deauth frames
+- Tracks new BSSIDs across sessions (up to 1000 entries)
+- DB-backed: `rogue_ap_events` table records both beacon and deauth events
+- Alert callbacks for real-time WebSocket broadcasting
 
----
+### API Endpoints (13 new)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/capture/start-streaming` | Begin streaming analysis (duration, BPF filter) |
+| `POST` | `/capture/stop-streaming` | Stop active streaming capture |
+| `GET` | `/capture/streaming-status` | Is capture running? |
+| `GET` | `/capture/analysis-summary` | DB table counts (snapshots, HTTP, DNS, ...) |
+| `GET` | `/capture/top-talkers` | IPs by total bytes |
+| `POST` | `/capture/rogue-scan` | Scan for Aps + deauths (monitor interface) |
+| `GET` | `/capture/rogue-events` | Rogue AP / deauth history |
+| `GET` | `/capture/http-logs` | HTTP request/response log |
+| `GET` | `/capture/dns-logs` | DNS query log |
+| `GET` | `/capture/tls-logs` | TLS handshake log |
+| `GET` | `/capture/anomalies` | Traffic anomaly events (filterable by min_score) |
+| `GET` | `/capture/suspicious-dns` | DNS tunneling detection events |
+| `GET` | `/capture` | Backward-compat file-based capture |
+
+### DB Tables (9 new)
+`traffic_snapshots`, `http_logs`, `dns_logs`, `tls_logs`, `dhcp_logs`,
+`suspicious_dns`, `traffic_baselines`, `anomaly_events`, `rogue_ap_events`
 
 ## PHASE 5 — DATABASE & PERSISTENCE (foundation upgrade)
 

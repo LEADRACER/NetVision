@@ -57,6 +57,9 @@ from task_queue import (
     ScanTaskQueue, Priority, ScanTask, ScanSchedule, ScanDiff,
 )
 from cve_lookup import CVELookupClient
+from packet_analyzer import StreamingPacketAnalyzer
+from protocol_decoder import ProtocolDecoder
+from traffic_baseline import TrafficBaseliner
 
 
 # ── Initialize structured logging ────────────────────────────────────────
@@ -73,8 +76,8 @@ os.makedirs(settings.reports_dir, exist_ok=True)
 
 # ── Initialize services ──────────────────────────────────────────────────
 scanner = NetworkScanner()
-capturer = PacketCapturer(interface=settings.capture_interface)
 db = Database(settings.database_path_abs)
+capturer = PacketCapturer(interface=settings.capture_interface, db=db)
 geo = GeoLocator(db, cache_ttl=settings.geo_cache_ttl)
 reporter = ReportGenerator(db)
 health_monitor = NetworkHealthMonitor(db, interval=settings.health_check_interval)
@@ -1002,6 +1005,245 @@ async def correlate_vulnerabilities(
         "services_checked": len(rows),
         "cves_found": total_cves,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 4: PACKET CAPTURE & TRAFFIC ANALYSIS ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════
+
+
+@app.post("/capture/start-streaming")
+async def start_streaming_capture(
+    duration: int = Body(30, ge=1, le=600),
+    bpf_filter: str = Body("", description="BPF filter expression"),
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Start streaming packet capture with real-time protocol analysis."""
+    if capturer._streaming:
+        raise HTTPException(status_code=409, detail="Streaming capture already in progress")
+
+    # Wire WebSocket broadcast callback
+    async def broadcast_callback(snapshot_data):
+        await manager.broadcast({
+            "type": "traffic_snapshot",
+            "data": snapshot_data,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+    capturer.on_snapshot(broadcast_callback)
+
+    # Run in background
+    asyncio.create_task(capturer.start_streaming(duration=duration, bpf_filter=bpf_filter))
+
+    logger.info("Streaming capture started",
+                extra={"component": "api", "duration": duration, "bpf_filter": bpf_filter})
+    return {
+        "status": "started",
+        "duration": duration,
+        "bpf_filter": bpf_filter or "none",
+    }
+
+
+@app.post("/capture/stop-streaming")
+async def stop_streaming_capture(
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Stop streaming packet capture."""
+    if not capturer._streaming:
+        raise HTTPException(status_code=409, detail="No streaming capture active")
+    await capturer.stop_streaming()
+    logger.info("Streaming capture stopped",
+                extra={"component": "api"})
+    return {"status": "stopped"}
+
+
+@app.get("/capture/streaming-status")
+async def streaming_capture_status(
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get streaming capture status."""
+    return {
+        "streaming": capturer._streaming,
+        "snapshot_callbacks": len(capturer._snapshot_callbacks),
+    }
+
+
+@app.get("/capture/analysis-summary")
+async def capture_analysis_summary(
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get summary statistics from packet capture analysis."""
+    return db.get_packet_analysis_summary()
+
+
+@app.get("/capture/top-talkers")
+async def get_top_talkers(
+    limit: int = Query(10, le=100),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get top IPs by traffic volume."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ip, mac,
+                   SUM(packets_sent + packets_recv) as total_packets,
+                   SUM(bytes_sent + bytes_recv) as total_bytes
+            FROM traffic_snapshots
+            GROUP BY ip ORDER BY total_bytes DESC LIMIT ?
+        """, (limit,))
+        top = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return top
+    except Exception as e:
+        logger.error("Top talkers query failed",
+                     extra={"component": "api", "error": str(e)})
+        return []
+
+
+@app.post("/capture/rogue-scan")
+async def scan_rogue_aps(
+    duration: int = Body(10, ge=5, le=120),
+    monitor_interface: str = Body("", description="Monitor interface (e.g., wlan0mon)"),
+    current_user: User = Depends(require_role(Role.OPERATOR)),
+):
+    """Scan for rogue access points and deauthentication frames."""
+    result = await capturer.scan_for_rogue_aps(
+        duration=duration,
+        monitor_interface=monitor_interface or "",
+    )
+    total_aps = len(result.get("access_points", []))
+    total_deauths = result.get("total_deauth", 0)
+    logger.info("Rogue AP scan finished",
+                extra={"component": "api", "access_points": total_aps, "deauth_frames": total_deauths})
+    return result
+
+
+@app.get("/capture/rogue-events")
+async def get_rogue_events(
+    limit: int = Query(50, le=500),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get rogue AP and deauth detection events."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM rogue_ap_events
+            ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        events = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return events
+    except Exception as e:
+        logger.error("Rogue events query failed",
+                     extra={"component": "api", "error": str(e)})
+        return []
+
+
+@app.get("/capture/http-logs")
+async def get_http_logs(
+    limit: int = Query(50, le=500),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get HTTP request/response logs."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM http_logs ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        logs = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return logs
+    except Exception as e:
+        return []
+
+
+@app.get("/capture/dns-logs")
+async def get_dns_logs(
+    limit: int = Query(50, le=500),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get DNS query logs."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM dns_logs ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        logs = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return logs
+    except Exception as e:
+        return []
+
+
+@app.get("/capture/tls-logs")
+async def get_tls_logs(
+    limit: int = Query(50, le=500),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get TLS handshake logs."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM tls_logs ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        logs = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return logs
+    except Exception as e:
+        return []
+
+
+@app.get("/capture/anomalies")
+async def get_traffic_anomalies(
+    limit: int = Query(50, le=500),
+    min_score: float = Query(0.0),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get traffic anomaly events."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM anomaly_events
+            WHERE score >= ?
+            ORDER BY id DESC LIMIT ?
+        """, (min_score, limit))
+        events = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return events
+    except Exception as e:
+        return []
+
+
+@app.get("/capture/suspicious-dns")
+async def get_suspicious_dns(
+    limit: int = Query(50, le=500),
+    current_user: User = Depends(require_role(Role.VIEWER)),
+):
+    """Get suspicious DNS tunneling detection events."""
+    try:
+        conn = sqlite3.connect(settings.database_path_abs)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM suspicious_dns ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        events = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return events
+    except Exception as e:
+        return []
 
 
 if __name__ == "__main__":
