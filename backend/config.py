@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     log_json: bool = True
     log_console: bool = True
 
+    # ── Phase 5: Data Retention ─────────────────────────────────────────
+    prune_health_days: int = 90        # Health metrics retention in days
+    prune_audit_days: int = 30         # Audit log retention in days
+    prune_capture_days: int = 7        # Capture file retention in days
+
     # ── Phase 2: Auth & API Security ──────────────────────────────────────
     jwt_secret: str = "netvision-dev-secret-change-in-prod"
     jwt_expire_seconds: int = 3600          # 1 hour for access tokens

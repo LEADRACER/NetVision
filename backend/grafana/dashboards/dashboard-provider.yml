@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: "NetVision"
+    folder: "NetVision"
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /etc/grafana/provisioning/dashboards

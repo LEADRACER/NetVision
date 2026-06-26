@@ -46,6 +46,9 @@ from auth import (
 from rate_limiter import (
     RateLimitMiddleware, check_scan_rate_limit, API_RATE_LIMITER,
 )
+
+# ── Phase 6: WebSocket Manager import ────────────────────────────────────
+from websocket_manager import manager as ws_manager
 from security import (
     SecurityHeadersMiddleware,
     ScanTargetValidation, CaptureRequestValidation,
@@ -105,42 +108,87 @@ app.add_middleware(MetricsMiddleware)
 app.add_middleware(RequestIDMiddleware, db=db)
 
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-
-    async def broadcast(self, message: dict):
-        connections = self.active_connections[:]
-
-        async def safe_send(conn):
-            try:
-                await conn.send_json(message)
-                return True
-            except Exception:
-                return False
-
-        results = await asyncio.gather(*(safe_send(conn) for conn in connections))
-        for conn, ok in zip(connections, results):
-            if not ok:
-                try:
-                    self.disconnect(conn)
-                except ValueError:
-                    pass
-
-
-manager = ConnectionManager()
+# ── WebSocket manager (Phase 6) ──────────────────────────────────────────
+# The new WebSocketManager lives in websocket_ws_manager.py with:
+#   - Per-client async queues (slow clients don't block)
+#   - Ping/pong heartbeat (30s interval, 10s timeout)
+#   - Topic-based subscriptions (scan.progress, health.alert, ...)
+#   - Versioned state history for reconnection sync
+#   - Event stream helpers (broadcast_scan_progress, broadcast_vuln_found, ...)
 
 
 @app.on_event("startup")
 async def startup_event():
     db.init_tables()
+
+    # ── Phase 7: Startup probes ──────────────────────────────────────────
+    probes_passed = 0
+    probes_failed = 0
+
+    # 1. Verify DB is writable
+    try:
+        with db._get_conn() as conn:
+            conn.execute("SELECT 1").fetchone()
+        logger.info("Probe: DB writable", extra={"component": "system"})
+        probes_passed += 1
+    except Exception as e:
+        logger.error("Probe FAILED: DB not writable", error=str(e),
+                     extra={"component": "system"})
+        probes_failed += 1
+
+    # 2. Verify nmap installation
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nmap", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        first_line = stdout.decode().split("\n")[0] if stdout else "unknown"
+        logger.info("Probe: nmap available", version=first_line,
+                    extra={"component": "system"})
+        probes_passed += 1
+    except (FileNotFoundError, asyncio.TimeoutError) as e:
+        logger.warning("Probe: nmap not found — scanning disabled",
+                       extra={"component": "system"})
+        probes_failed += 1
+
+    # 3. Verify tshark installation
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tshark", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        first_line = stdout.decode().split("\n")[0] if stdout else "unknown"
+        logger.info("Probe: tshark available", version=first_line,
+                    extra={"component": "system"})
+        probes_passed += 1
+    except (FileNotFoundError, asyncio.TimeoutError) as e:
+        logger.warning("Probe: tshark not found — packet capture disabled",
+                       extra={"component": "system"})
+        probes_failed += 1
+
+    # 4. Pre-warm geo cache (non-blocking, best-effort)
+    # Warm up by checking if the geo API is reachable
+    try:
+        result = geo.lookup("8.8.8.8", force_refresh=False)
+        if result:
+            logger.info("Probe: Geo IP API reachable",
+                        extra={"component": "system"})
+        else:
+            logger.info("Probe: Geo IP API responded (cached or no data)",
+                        extra={"component": "system"})
+        probes_passed += 1
+    except Exception as e:
+        logger.info("Probe: Geo IP API warmup skipped",
+                    extra={"component": "system", "reason": str(e)})
+        probes_passed += 1  # Not critical
+
+    logger.info("Startup probes complete",
+                passed=probes_passed, failed=probes_failed,
+                extra={"component": "system"})
 
     # ── Configure alert webhooks from environment ───────────────────────
     slack_url = os.getenv("ALERT_SLACK_WEBHOOK", "")
@@ -166,10 +214,10 @@ async def startup_event():
     # ── Data retention sweep (non-blocking) ─────────────────────────────
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, db.prune_health_metrics, 90)
-        await loop.run_in_executor(None, db.prune_audit_log, 30)
+        await loop.run_in_executor(None, db.prune_health_metrics, settings.prune_health_days)
+        await loop.run_in_executor(None, db.prune_audit_log, settings.prune_audit_days)
         await loop.run_in_executor(
-            None, db.prune_old_captures, 7, settings.captures_dir
+            None, db.prune_old_captures, settings.prune_capture_days, settings.captures_dir
         )
         logger.info("Data retention sweep complete", extra={"component": "system"})
     except Exception as e:
@@ -184,9 +232,12 @@ async def startup_event():
     scan_queue.on_task_complete(_on_scan_complete)
     await scan_queue.start()
     
-    # Wire health monitor state changes → auto-rescan
+    # Wire health monitor state changes → auto-rescan + WebSocket alert
     async def health_state_changed(ip: str, old_state: str, new_state: str, device_info: dict):
-        """Auto-enqueue a scan when a device transitions state."""
+        """Auto-enqueue a scan when a device transitions state and broadcast health alert."""
+        # Broadcast health alert to all subscribed WS clients
+        asyncio.create_task(ws_manager.broadcast_health_alert(ip, old_state, new_state, device_info))
+
         if old_state == "up" and new_state == "down":
             logger.info("Auto-rescan triggered by device down", ip=ip)
             await alert_manager.send_alert(
@@ -230,21 +281,70 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    """Graceful shutdown — drain active tasks, flush connections, log summary."""
+    logger.info("Shutting down NetVision — draining active tasks...",
+                extra={"component": "system"})
+
+    # Phase 7: Stop streaming capture if running
+    if getattr(capturer, '_streaming', False):
+        try:
+            await capturer.stop_streaming()
+            logger.info("Streaming capture stopped",
+                        extra={"component": "system"})
+        except Exception as e:
+            logger.warning("Error stopping capture", error=str(e),
+                           extra={"component": "system"})
+
+    # Log pending queue state before draining
+    pending = scan_queue.pending_count
+    logger.info("Scan queue state", pending=pending,
+                extra={"component": "system"})
+
+    # Existing graceful shutdown sequence
     await health_monitor.stop()
     await scan_queue.stop()
     await cve_client.close()
-    logger.info("NetVision shutdown complete", extra={"component": "system"})
+    await ws_manager.shutdown()
+
+    # Log final metrics summary
+    logger.info("NetVision shutdown complete",
+                extra={"component": "system"})
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    try:
-        await websocket.send_json({"type": "update", "devices": latest_results, "is_scanning": scan_queue.is_active})
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
+    """WebSocket endpoint with heartbeats, subscriptions, and state sync.
+
+    Protocol
+    --------
+    Server → Client on connect:
+        {"type": "state", "devices": [...], "is_scanning": bool, "_v": int}
+
+    Client can send:
+        {"type": "pong"}                          — heartbeat ACK
+        {"type": "reconnect", "last_version": N}  — request missed events
+        {"type": "subscribe", "topics": [...]}     — subscribe to topics
+        {"type": "unsubscribe", "topics": [...]}   — unsubscribe from topics
+
+    Server → Client:
+        {"type": "ping"}                          — heartbeat (every 30s)
+        {"type": "subscribed", "topics": [...]}    — subscribe response
+        {"type": "unsubscribed", "topics": [...]}  — unsubscribe response
+        {"event": "scan.progress", ...}            — typed event streams
+    """
+    # Accept and wrap the client
+    client = await ws_manager.connect(websocket)
+
+    # Send initial state snapshot with version
+    client.send({
+        "type": "state",
+        "devices": latest_results,
+        "is_scanning": scan_queue.is_active,
+        "_v": ws_manager._version_counter,
+    })
+
+    # Let the manager handle the full lifecycle (heartbeat, subscriptions, pong)
+    await ws_manager.handle_client(client)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -436,7 +536,7 @@ async def start_scan(
     )
 
     SCANS_TOTAL.labels(profile=profile).inc()
-    await manager.broadcast({"type": "status", "is_scanning": True})
+    await ws_manager.broadcast_scan_status(True)
 
     logger.info("Scan enqueued", extra={
         "component": "api", "target": target or "local_subnet",
@@ -462,8 +562,8 @@ async def stop_scan(
     if hasattr(scan_queue, "_active_future") and scan_queue._active_future and not scan_queue._active_future.done():
         scan_queue._active_future.cancel()
     SCANS_IN_PROGRESS.dec()
-    await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
-    logger.info("Scan stopped by user", extra={"component": "api", "user": current_user.username})
+    await ws_manager.broadcast_scan_status(False, latest_results)
+    logger.info('Scan stopped by user', extra={'component': 'api', 'user': current_user.username})
     return {"status": "stopped", "message": "Active scan cancelled"}
 
 
@@ -487,11 +587,11 @@ async def run_scan_task(task: ScanTask):
             else:
                 latest_results.append(res)
         asyncio.create_task(
-            manager.broadcast({"type": "update", "devices": latest_results, "is_scanning": True})
+            ws_manager.broadcast_scan_progress(latest_results, True)
         )
 
     async def subnet_callback(subnet):
-        asyncio.create_task(manager.broadcast({"type": "subnet_start", "subnet": subnet}))
+        asyncio.create_task(ws_manager.broadcast_subnet_start(subnet))
 
     scan_start = datetime.now()
     try:
@@ -538,6 +638,16 @@ async def run_scan_task(task: ScanTask):
                             vuln_data=cve,
                         )
                         cve_count += 1
+                        # Broadcast vuln.found event
+                        asyncio.create_task(
+                            ws_manager.broadcast_vuln_found(
+                                device_ip=dev["ip"],
+                                cve_id=cve.get("cve_id", "UNKNOWN"),
+                                severity=cve.get("severity", "UNKNOWN"),
+                                cvss=cve.get("cvss_score", 0.0),
+                                description=cve.get("description", ""),
+                            )
+                        )
 
         logger.info("Scan completed", extra={
             "component": "scanner", "scan_id": scan_id,
@@ -562,7 +672,7 @@ async def run_scan_task(task: ScanTask):
         return None
     finally:
         SCANS_IN_PROGRESS.dec()
-        await manager.broadcast({"type": "status", "is_scanning": False, "devices": latest_results})
+        await ws_manager.broadcast_scan_status(False, latest_results)
 
 
 async def _on_scan_complete(task: ScanTask, diff: Optional[ScanDiff]):
@@ -643,7 +753,7 @@ async def get_devices(
     HEALTH_DEVICES_UP.set(up_count)
     HEALTH_DEVICES_DOWN.set(down_count)
 
-    return {"devices": latest_results, "is_scanning": is_scanning}
+    return {"devices": latest_results, "is_scanning": scan_queue.is_active}
 
 
 @app.get("/health/history")
@@ -1022,15 +1132,21 @@ async def start_streaming_capture(
     if capturer._streaming:
         raise HTTPException(status_code=409, detail="Streaming capture already in progress")
 
-    # Wire WebSocket broadcast callback
+    # Wire WebSocket broadcast callback for live capture data
     async def broadcast_callback(snapshot_data):
-        await manager.broadcast({
-            "type": "traffic_snapshot",
-            "data": snapshot_data,
-            "timestamp": datetime.now().isoformat(),
-        })
+        await ws_manager.broadcast_capture_data(snapshot_data)
+
+    # Wire capture alert callback (SYN flood, ARP spoof, rogue AP, etc.)
+    async def alert_callback(alert_data: dict):
+        await ws_manager.broadcast_capture_alert(
+            alert_type=alert_data.get("type", "unknown"),
+            ip=alert_data.get("ip", ""),
+            mac=alert_data.get("mac", ""),
+            detail=alert_data,
+        )
 
     capturer.on_snapshot(broadcast_callback)
+    capturer.on_alert(alert_callback)
 
     # Run in background
     asyncio.create_task(capturer.start_streaming(duration=duration, bpf_filter=bpf_filter))
@@ -1244,6 +1360,60 @@ async def get_suspicious_dns(
         return events
     except Exception as e:
         return []
+
+
+# ── Phase 7: Frontend static serving ─────────────────────────────────────
+import os as _os
+_frontend_dir = _os.path.join(_os.path.dirname(__file__), "..", "frontend", "dist")
+if _os.path.isdir(_frontend_dir):
+    app.mount("/assets", StaticFiles(directory=_os.path.join(_frontend_dir, "assets")), name="assets")
+
+    @app.exception_handler(404)
+    async def spa_404_handler(request, exc):
+        """Serve index.html for all unmatched GET routes (SPA fallback)."""
+        if request.method == "GET":
+            _path = _os.path.join(_frontend_dir, "index.html")
+            if _os.path.isfile(_path):
+                return FileResponse(_path)
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
+    logger.info("Frontend static serving enabled", directory=_frontend_dir,
+                extra={"component": "system"})
+else:
+    logger.info("No frontend build found — skipping static serving",
+                extra={"component": "system"})
+
+
+@app.get("/api/config")
+def get_config():
+    """Return client-relevant config including local subnet for scan auto-fill."""
+    import subprocess
+    local_subnet = None
+    try:
+        # Get the default route's network
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.stdout:
+            # Parse: default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.42 metric 100
+            parts = result.stdout.split()
+            if "src" in parts:
+                src_idx = parts.index("src")
+                if src_idx + 1 < len(parts):
+                    local_ip = parts[src_idx + 1]
+                    # Derive /24 subnet from IP
+                    ip_parts = local_ip.split(".")
+                    local_subnet = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.0/24"
+    except Exception:
+        pass
+
+    return {
+        "local_subnet": local_subnet,
+        "network_range": local_subnet,
+        "api_host": settings.api_host,
+        "api_port": settings.api_port,
+    }
 
 
 if __name__ == "__main__":
